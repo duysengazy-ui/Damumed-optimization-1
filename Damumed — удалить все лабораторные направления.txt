@@ -1,0 +1,140 @@
+// ==UserScript==
+// @name         Damumed — удалить все лабораторные направления
+// @namespace    local.damumed.labs.delete
+// @version      1.2.0
+// @description  Выделяет только лабораторные направления текущей записи и запускает штатное удаление.
+// @match        https://doc-ast.dmed.kz/MedicalRecords*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(() => {
+  'use strict';
+  if (window.top !== window.self || document.getElementById('local-labs-delete-helper')) return;
+  const norm = v => String(v ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  const visible = e => !!e?.isConnected && !!e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+  const fail = text => { throw new Error(text); };
+  const host = document.createElement('div'); host.id = 'local-labs-delete-helper';
+  const style = document.createElement('style');
+  style.textContent = '#local-labs-delete-helper{position:fixed;top:40px;right:18px;z-index:2147483646;font:14px Arial;color:#172333}#local-labs-delete-helper button{padding:6px 10px;font:14px Arial;cursor:pointer}#local-labs-delete-helper button:disabled{cursor:default}#local-labs-delete-helper .ld-panel{position:fixed;right:18px;top:80px;width:min(480px,calc(100vw - 56px));background:#fff;border:2px solid #744;border-radius:7px;padding:16px;box-shadow:0 8px 24px #0004}#local-labs-delete-helper label{display:block;margin:12px 0}#local-labs-delete-helper p{white-space:pre-wrap;line-height:1.45}#local-labs-delete-helper .danger{background:#b00020;color:#fff;border:0}';
+  host.append(style); document.documentElement.append(host);
+  const button = (text, fn, parent = host) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = text; b.onclick = fn; parent.append(b); return b; };
+  let panel = null, status = null, busy = false;
+  function context() {
+    const frames = [...document.querySelectorAll('iframe[id^="iframeMedRec_"]')].filter(visible);
+    if (frames.length !== 1) fail('Откройте одну медзапись.');
+    const frame = frames[0], id = frame.id.slice('iframeMedRec_'.length), body = frame.contentDocument?.querySelector('body[id^="editor_"]');
+    if (!/^\d+$/.test(id) || !body) fail('Редактор медзаписи недоступен.');
+    const grid = document.querySelector('#grdMedRecDestinations_' + CSS.escape(id));
+    if (!grid || !visible(grid)) fail('Откройте раздел «Назначения».');
+    return { id, frame, body, grid, text: body.innerText, url: location.href };
+  }
+  async function ensureContext() {
+    try { return context(); } catch (first) {
+      const link = [...document.querySelectorAll('a[href*="MedicalRecordDestinations"]')].find(visible);
+      if (!link) throw first;
+      link.click();
+      const end = Date.now() + 5000;
+      while (Date.now() < end) { try { return context(); } catch {} await new Promise(resolve => setTimeout(resolve, 150)); }
+      throw first;
+    }
+  }
+  function report(text) { if (status) status.textContent = text; }
+  function labRows(c) {
+    return [...c.grid.querySelectorAll('tbody tr[data-uid]')].filter(row => /(?:^|\/\s*)B\d{2}(?:\.|\s)/i.test(norm(row.innerText)) && row.querySelector('input.chbRefferalDestination'));
+  }
+  function checkStable(c) {
+    const now = context();
+    if (now.id !== c.id || now.grid !== c.grid || now.body !== c.body || now.text !== c.text || now.url !== c.url) fail('Медзапись или список назначений изменились. Удаление остановлено.');
+  }
+  async function completeReasonDialog() {
+    const end = Date.now() + 1800;
+    while (Date.now() < end) {
+      const reasonInput = document.querySelector('#cmbHReferralRejectionReason');
+      if (reasonInput) {
+        const wrap = reasonInput.closest('.k-dropdown, .k-widget') || reasonInput.parentElement;
+        const arrow = wrap?.querySelector('.k-select, .k-icon.k-i-arrow-s');
+        if (arrow && visible(arrow)) {
+          arrow.click();
+          await new Promise(resolve => setTimeout(resolve, 100));
+          const option = [...document.querySelectorAll('#cmbHReferralRejectionReason_listbox li, [id^="cmbHReferralRejectionReason_listbox"] li')].find(e => visible(e) && /^не указано$/i.test(norm(e.textContent)));
+          if (option) option.click();
+        }
+      }
+      const dialog = [...document.querySelectorAll('.modal, [role="dialog"], .k-window')].find(e => visible(e) && (/причин/i.test(norm(e.innerText)) || e.querySelector('#cmbHReferralRejectionReason')));
+      if (dialog) {
+        const selects = [...dialog.querySelectorAll('select')];
+        for (const select of selects) {
+          const option = [...select.options].find(o => /не указано|не указана/i.test(norm(o.textContent)));
+          if (option) { select.value = option.value; select.dispatchEvent(new Event('change', { bubbles: true })); }
+        }
+        const inputs = [...dialog.querySelectorAll('input')].filter(visible);
+        for (const input of inputs) {
+          if (/причин/i.test((input.name || '') + ' ' + (input.placeholder || '') + ' ' + (input.getAttribute('aria-label') || ''))) {
+            input.value = 'Не указано'; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+        const confirm = [...dialog.querySelectorAll('button, a, input[type="button"], input[type="submit"]')].find(e => visible(e) && /удалить/i.test(norm(e.textContent || e.value)));
+        if (confirm) { confirm.click(); return true; }
+        fail('Диалог причины удаления найден, но вариант «Не указано» или кнопка удаления недоступны.');
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return false;
+  }
+  function openPanel() {
+    if (panel) { if (!busy) { panel.remove(); panel = null; } return; }
+    panel = document.createElement('section'); panel.className = 'ld-panel'; host.append(panel);
+    const title = document.createElement('b'); title.textContent = 'Удаление лабораторных направлений'; panel.append(title);
+    const info = document.createElement('p'); panel.append(info);
+    const label = document.createElement('label'), confirm = document.createElement('input'); confirm.type = 'checkbox'; label.append(confirm, ' Я проверил(а) список и разрешаю удалить все лабораторные направления'); panel.append(label);
+    status = document.createElement('p'); status.setAttribute('role', 'status'); panel.append(status);
+    const remove = button('Выделить и удалить лабораторные', async () => {
+      if (busy || !confirm.checked) return;
+      busy = true; remove.disabled = true; confirm.disabled = true;
+      try {
+        const initial = await ensureContext(), initialLabs = labRows(initial);
+        if (!initialLabs.length) fail('В текущей записи лабораторные направления не найдены.');
+        const selectedOther = [...initial.grid.querySelectorAll('tbody tr.k-state-selected[data-uid], tbody tr[aria-selected="true"][data-uid]')].some(row => !initialLabs.includes(row)) || [...initial.grid.querySelectorAll('input.chbRefferalDestination:checked')].some(cb => !initialLabs.includes(cb.closest('tr')));
+        if (selectedOther) fail('Уже выбрано другое назначение. Снимите выделение вручную, затем повторите.');
+        let removed = 0;
+        while (true) {
+          const c = await ensureContext(), rows = labRows(c);
+          if (!rows.length) break;
+          const before = rows.length, row = rows.find(r => r.classList.contains('k-state-selected') || r.getAttribute('aria-selected') === 'true') || rows[0];
+          if (!(row.classList.contains('k-state-selected') || row.getAttribute('aria-selected') === 'true')) {
+            const target = row.querySelector('td[role="gridcell"]:nth-child(3)') || row;
+            ['mousedown', 'mouseup', 'click'].forEach(type => target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })));
+            await new Promise(resolve => setTimeout(resolve, 100));
+            if (!(row.classList.contains('k-state-selected') || row.getAttribute('aria-selected') === 'true')) {
+              row.classList.add('k-state-selected'); row.setAttribute('aria-selected', 'true');
+            }
+          }
+          if (!(row.classList.contains('k-state-selected') || row.getAttribute('aria-selected') === 'true')) fail('Не удалось выбрать лабораторную строку зелёным цветом.');
+          const group = document.querySelector('#destinationRowButtons_' + CSS.escape(c.id));
+          if (!group) fail('Меню удаления назначений не найдено.');
+          const toggle = group.querySelector('button.dropdown-toggle'); if (!toggle) fail('Кнопка меню удаления не найдена.');
+          let nativeRemove = document.querySelector('#btnRemoveDestionation_' + CSS.escape(c.id));
+          if (!visible(nativeRemove)) { toggle.click(); await new Promise(resolve => setTimeout(resolve, 150)); }
+          nativeRemove = document.querySelector('#btnRemoveDestionation_' + CSS.escape(c.id));
+          if (!nativeRemove || !visible(nativeRemove)) fail('Штатный пункт «Удалить» не открылся.');
+          report('Выбрано зелёным: ' + (before - removed) + ' из ' + initialLabs.length + '. Удаляю штатным действием…');
+          nativeRemove.click();
+          await completeReasonDialog();
+          await new Promise(resolve => setTimeout(resolve, 400));
+          const after = labRows(await ensureContext()).length;
+          if (after >= before) fail('Штатное удаление вызвано, но выбранная строка не исчезла. Проверьте сообщение Damumed и список вручную.');
+          removed += before - after;
+        }
+        report('Удалено лабораторных направлений: ' + removed + '. Проверьте список.');
+      } catch (error) { report(error.message + '\nНи одно неконтролируемое удаление не выполнялось.'); }
+      finally { busy = false; remove.disabled = false; confirm.disabled = false; confirm.checked = false; }
+    }, panel); remove.classList.add('danger'); remove.disabled = true;
+    confirm.onchange = () => { remove.disabled = busy || !confirm.checked; };
+    button('Обновить число', () => { try { const c = context(); info.textContent = 'Найдено лабораторных направлений: ' + labRows(c).length + '. Удаляются только строки с кодом Bxx.xxx.xxx.'; } catch (e) { info.textContent = e.message; } }, panel);
+    button('Закрыть', () => { if (!busy) { panel.remove(); panel = null; document.documentElement.append(host); } }, panel);
+    try { const c = context(); info.textContent = 'Найдено лабораторных направлений: ' + labRows(c).length + '. Удаляются только строки с кодом Bxx.xxx.xxx.'; } catch (e) { info.textContent = e.message; }
+  }
+  button('Удалить анализы', openPanel);
+})();

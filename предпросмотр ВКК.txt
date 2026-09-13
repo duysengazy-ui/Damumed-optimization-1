@@ -1,0 +1,498 @@
+// ==UserScript==
+// @name         Damumed — предпросмотр для ВКК
+// @namespace    local.damumed.vkk
+// @version      1.3.2
+// @description  Предпросмотр, четыре раздела, существующие контакты и диагноз в ВКК без сохранения.
+// @match        https://doc-ast.dmed.kz/*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(() => {
+  'use strict';
+  if (window.top !== window.self || document.getElementById('local-vkk-helper')) return;
+  const headings = ['Анамнез заболевания', 'Анамнез жизни', 'Психический статус', 'Диагноз', 'Лечение', 'Рекомендовано'];
+  const headingPatterns = ['(?:Анамнез\\s+заболевани[яй]|Катамнез)', 'Анамнез\\s+жизни', '(?:Психический\\s+статус\\s*\\/\\s*Психическое\\s+состояние|Психический\\s+статус|Психическое\\s+состояние|Психоэмоциональное\\s+состояние)', 'Диагноз', 'Лечение', 'Рекомендовано'];
+  const fields = [
+    ['taComplaintText', 'Жалобы / начальный блок — проверьте преамбулу'],
+    ['taAnamnesisSickText', 'Анамнез заболевания'],
+    ['taAnamnesisLifeText', 'Анамнез жизни'],
+    ['taObjectiveDataText', 'Объективные данные ← Психический статус']
+  ];
+  const reasonText = 'Оценка состояния здоровья пациентов, направленных на ВКК и вынесение заключения ВКК';
+  const normalize = s => String(s).replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\u00A0/g, ' ');
+  const comparable = s => normalize(s).replace(/\s+/g, ' ').trim();
+  const fail = message => { throw new Error(message); };
+  const visible = el => !!el && el.isConnected && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+
+  function extract(text, withDiagnosis = false) {
+    const blocks = Array.from({ length: 7 }, () => []);
+    const seen = new Set();
+    const warnings = [];
+    let genericAnamnesis = false;
+    let section = 0;
+    const followUp = 'Состоит\\s+на\\s+(?:Д\\s*[-–—‑]?\\s*уч[её]те|диспансерном\\s+уч[её]те)(?=\\s|[.,;:]|$)';
+    // Явные подзаголовки с двоеточием распознаём и внутри общего абзаца.
+    const lines = text.replace(/\r\n?/g, '\n')
+      .replace(new RegExp('([^\\n])\\s+(?=(?:' + headingPatterns.join('|') + ')\\s*:)', 'gi'), '$1\n')
+      .replace(new RegExp('([.!?])[^\\S\\n]+(?=' + followUp + ')', 'gi'), '$1\n').split('\n');
+    for (const line of lines) {
+      // Поиск по нормализованной строке; содержимое берём из исходной.
+      let clean = '', positions = [];
+      for (let i = 0; i < line.length; i++) {
+        if (/[\u200B-\u200D\uFEFF]/.test(line[i])) continue;
+        positions.push(i); clean += line[i] === '\u00A0' ? ' ' : line[i];
+      }
+      let found = false;
+      for (let i = 0; i < headings.length; i++) {
+        const pattern = genericAnamnesis && i < 2 ? '(?:' + headingPatterns[i] + '|' + (i === 0 ? 'Заболевания' : 'Жизни') + ')' : headingPatterns[i];
+        const match = clean.match(new RegExp('^\\s*' + pattern + '(?=\\s|:|$)\\s*:?\\s*', 'i'));
+        if (!match) continue;
+        const catamnesis = i === 0 && /^\s*Катамнез(?=\s|:|$)/i.test(clean);
+        if (seen.has(i) && !catamnesis) fail('Повторяется заголовок «' + headings[i] + '». Перенос остановлен.');
+        if (!catamnesis) seen.add(i);
+        if (catamnesis) warnings.push('Катамнез помещён в анамнез заболевания. Проверьте распределение текста в предпросмотре.');
+        section = i + 1; found = true;
+        blocks[section].push(line.slice(positions[match[0].length] ?? line.length));
+        break;
+      }
+      if (!found) {
+        // Только явный признак наблюдения за заболеванием в начале фразы.
+        // Не переносим отрицания или упоминания учёта внутри жалобы.
+        if (section === 0 && new RegExp('^\\s*' + followUp, 'i').test(clean)) {
+          section = 1;
+          warnings.push('Текст начиная с «Состоит на … учёте» помещён в анамнез заболевания. Проверьте его в предпросмотре.');
+        }
+        const generic = clean.match(/^\s*Анамнез\s*:?\s*$/i) || clean.match(/^\s*Анамнез\s*:\s*/i);
+        if (generic) {
+          genericAnamnesis = true; section = 1;
+          warnings.push('Общий «Анамнез»: текст без подзаголовков помещён в анамнез заболевания. Если он смешанный, распределите его между двумя полями в предпросмотре.');
+          blocks[section].push(line.slice(positions[generic[0].length] ?? line.length));
+        } else blocks[section].push(line);
+      }
+    }
+    const values = blocks.slice(0, 4).map(lines => lines.join('\n').trim());
+    for (const i of [0, 1, 2]) if (!values[i + 1]) warnings.push('Не найден или пуст раздел «' + headings[i] + '». Поле оставлено пустым; при необходимости заполните сами.');
+    if (values[3]) values[3] = 'Психический статус:\n' + values[3];
+    return withDiagnosis ? { values, warnings, diagnosis: seen.has(3) ? blocks[4].join('\n').trim() : null } : values;
+  }
+
+  function source() {
+    const frames = [...document.querySelectorAll('iframe[id^="iframeMedRec_"]')];
+    const candidates = [];
+    for (const frame of frames) {
+      let doc;
+      try { doc = frame.contentDocument; } catch { fail('Нет доступа к редактору записи.'); }
+      if (!doc) fail('Редактор ещё не доступен.');
+      for (const body of doc.querySelectorAll('body[id^="editor_"][contenteditable="true"]')) candidates.push({ frame, body });
+    }
+    if (candidates.length !== 1) fail('Нужна ровно одна открытая медзапись. Найдено редакторов: ' + candidates.length + '.');
+    const item = candidates[0];
+    if (!visible(item.frame)) fail('Редактор медзаписи скрыт. Откройте текущую запись.');
+    return { ...item, text: item.body.innerText, frameId: item.frame.id, bodyId: item.body.id };
+  }
+
+  function target() {
+    const forms = [...document.querySelectorAll('[id="fCommitteeDirection"]')];
+    if (forms.length !== 1 || !visible(forms[0])) fail('Откройте одну форму направления ВКК кнопкой «+».');
+    const form = forms[0];
+    const dialogs = [...document.querySelectorAll('[id^="dCommitteeDirectionForm_"]')].filter(d => d.contains(form) || form.contains(d));
+    if (dialogs.length !== 1 || !visible(dialogs[0])) fail('Не удалось однозначно определить открытый диалог ВКК.');
+    const inputs = fields.map(([id]) => {
+      const matches = form.querySelectorAll('textarea[id="' + id + '"]');
+      if (matches.length !== 1 || matches[0].disabled || matches[0].readOnly) fail('Поле формы недоступно: ' + id);
+      return matches[0];
+    });
+    return { form, dialog: dialogs[0], dialogId: dialogs[0].id, inputs };
+  }
+
+  function setReason(form) {
+    try {
+      const elements = form.querySelectorAll('[id="dpCommitteeDirectionReason"]');
+      const jq = window.jQuery;
+      if (elements.length !== 1 || !jq) return 'Причину выберите вручную: Kendo недоступен.';
+      const widget = jq(elements[0]).data('kendoDropDownList');
+      if (!widget || !widget.dataSource || typeof widget.trigger !== 'function') return 'Причину выберите вручную: виджет не найден.';
+      if (elements[0].disabled || elements[0].readOnly) return 'Причина недоступна для изменения; проверьте вручную.';
+      if (comparable(widget.text()) === comparable(reasonText)) return 'Причина уже выбрана.';
+      if (String(widget.value() ?? '') !== '') return 'Существующая причина сохранена. Проверьте её вручную.';
+      const textKey = widget.options.dataTextField, valueKey = widget.options.dataValueField;
+      if (!textKey || !valueKey) return 'Причину выберите вручную: неизвестна структура списка.';
+      const read = (item, key) => typeof item.get === 'function' ? item.get(key) : item[key];
+      const matches = Array.from(widget.dataSource.view()).filter(item => comparable(read(item, textKey)) === comparable(reasonText));
+      if (matches.length !== 1 || read(matches[0], valueKey) == null) return 'Причину выберите вручную: точное однозначное совпадение не загружено.';
+      const old = widget.value();
+      widget.value(read(matches[0], valueKey));
+      if (comparable(widget.text()) !== comparable(reasonText)) { widget.value(old); return 'Причину выберите вручную: выбор не подтверждён.'; }
+      widget.trigger('change');
+      return 'Причина выбрана по точному тексту; проверьте её в форме.';
+    } catch { return 'Не удалось подтвердить выбор причины. Проверьте её вручную.'; }
+  }
+
+  // Дополнения 1.1: существующие контакты и диагноз. Сохранение формы не вызывается.
+  function checkContext(old) {
+    if (!old || snapshot !== old) fail('Предпросмотр закрыт. Автоматическое заполнение остановлено.');
+    const current = source(), dest = target();
+    if (location.href !== old.url || current.frame !== old.src.frame || current.body !== old.src.body || current.frameId !== old.src.frameId || current.bodyId !== old.src.bodyId || current.text !== old.src.text) fail('Медзапись изменилась. Откройте предпросмотр заново.');
+    if (dest.form !== old.dst.form || dest.dialog !== old.dst.dialog || dest.dialogId !== old.dst.dialogId || dest.inputs.some((el, i) => el !== old.dst.inputs[i])) fail('Форма направления изменилась. Откройте предпросмотр заново.');
+    return dest;
+  }
+  const one = (scope, selector, label) => {
+    const found = scope.querySelectorAll(selector);
+    if (found.length !== 1) fail(label + ': элемент не найден однозначно. Выберите вручную.');
+    return found[0];
+  };
+  async function until(read, old, label, timeout = 3500) {
+    const end = Date.now() + timeout;
+    do {
+      checkContext(old);
+      const result = read();
+      if (result) return result;
+      await new Promise(resolve => setTimeout(resolve, 80));
+    } while (Date.now() < end);
+    fail(label + ': результат не подтверждён. Проверьте поле вручную.');
+  }
+  function writable(el) {
+    return !el.disabled && !el.readOnly && el.getAttribute('aria-disabled') !== 'true' && el.getAttribute('aria-readonly') !== 'true';
+  }
+  async function firstContact(old, id, label) {
+    const form = checkContext(old).form;
+    const hidden = one(form, '#' + id + '[data-role="combobox"]', label);
+    const input = one(form, 'input[name="' + id + '_input"]', label);
+    if (hidden.value !== '') return label + ': существующее значение сохранено; проверьте вручную.';
+    if (!writable(hidden) || !writable(input)) fail(label + ': поле недоступно. Выберите вручную.');
+    const arrow = one(form, '[role="button"][aria-controls="' + id + '_listbox"]', label);
+    const widget = window.jQuery?.(hidden).data('kendoComboBox');
+    const initialText = input.value;
+    const identity = () => {
+      checkContext(old);
+      if (!hidden.isConnected || !input.isConnected || form.querySelector('#' + id) !== hidden) fail(label + ': поле заменено. Операция остановлена.');
+    };
+    try {
+      if (widget && typeof widget.open === 'function') widget.open(); else arrow.click();
+      const options = await until(() => {
+        // Kendo сохраняет старые popup с теми же ID. Используем ul текущего
+        // виджета; DOM fallback рассматривает только один видимый список.
+        const ownList = widget?.ul?.[0];
+        const lists = ownList?.isConnected ? [ownList] : [...document.querySelectorAll('#' + id + '_listbox[role="listbox"]')].filter(visible);
+        if (lists.length !== 1 || !visible(lists[0]) || input.getAttribute('aria-busy') === 'true') return null;
+        const items = [...lists[0].querySelectorAll('li[role="option"]')].filter(e => visible(e) && e.getAttribute('aria-disabled') !== 'true' && !e.classList.contains('k-state-disabled') && comparable(e.textContent));
+        return items.length ? items : null;
+      }, old, label + ': доступный список');
+      identity();
+      if (hidden.value !== '' || input.value !== initialText) return label + ': значение изменено во время ожидания; оно сохранено.';
+      let option = options[0];
+      if (widget && typeof widget.select === 'function' && typeof widget.trigger === 'function' && typeof widget.dataItem === 'function') {
+        const allItems = Array.from(widget.items());
+        const read = (item, key) => item && key ? (typeof item.get === 'function' ? item.get(key) : item[key]) : undefined;
+        const textKey = widget.options.dataTextField, valueKey = widget.options.dataValueField;
+        const itemAt = el => widget.dataItem(allItems.indexOf(el));
+        if (!textKey || !valueKey) fail(label + ': неизвестна структура виджета. Выберите вручную.');
+        if (initialText !== '') {
+          const matches = options.filter(el => comparable(read(itemAt(el), textKey)) === comparable(initialText));
+          if (matches.length !== 1) fail(label + ': есть текст без подтверждённого ID. Выберите нужный вариант вручную; текст не заменён.');
+          option = matches[0];
+        }
+        const index = allItems.indexOf(option), item = itemAt(option);
+        const value = read(item, valueKey), text = read(item, textKey);
+        if (index < 0 || value == null || String(value) === '' || text == null) fail(label + ': не удалось определить существующий ID. Выберите вручную.');
+        identity();
+        widget.select(index);
+        if (widget.select() !== index || String(widget.value()) !== String(value)) fail(label + ': Kendo не подтвердил выбор. Выберите вручную.');
+        // select() не вызывает change сам: без этого связанная модель может
+        // остаться пустой, хотя строка визуально подсвечена.
+        widget.trigger('change');
+        hidden.dispatchEvent(new Event('input', { bubbles: true }));
+        hidden.dispatchEvent(new Event('change', { bubbles: true }));
+        await until(() => { identity(); return hidden.value === String(value) && widget.select() === index && String(widget.value()) === String(value) && comparable(input.value) === comparable(text) && comparable(widget.text()) === comparable(text); }, old, label);
+      } else {
+        if (initialText !== '') fail(label + ': есть текст без ID, Kendo API недоступен. Выберите вручную.');
+        const text = comparable(option.textContent);
+        option.click();
+        await until(() => { identity(); return hidden.value !== '' && comparable(input.value) === text; }, old, label);
+      }
+      return label + (initialText ? ': существующий текст сопоставлен с ID; выбор подтверждён.' : ': выбран и проверен первый доступный вариант.');
+    } finally {
+      // Не трогаем новую форму при переключении пациента или закрытии предпросмотра.
+      if (snapshot === old && hidden.isConnected && input.getAttribute('aria-expanded') === 'true') {
+        if (widget && typeof widget.close === 'function') widget.close(); else if (arrow.isConnected) arrow.click();
+      }
+    }
+  }
+  const codeOf = text => comparable(text).toUpperCase().replace(/[\s\-–—]/g, '').replace(/,$/, '').replace(/\.$/, '').replace(',', '.');
+  function diagnosisInfo(text) {
+    if (!text?.trim()) return { code: null, note: '', warning: 'Кода в тексте нет: будет использован единственный диагноз из списка текущей медзаписи.' };
+    const matches = [...normalize(text).matchAll(/(?:^|[^A-Za-zА-Яа-я0-9])([A-Za-z]\s*[-–—]?\s*\d{2}(?:[.,]\d{1,4})?)(?!\d)/g)];
+    const codes = [...new Set(matches.map(m => codeOf(m[1])))];
+    if (codes.length !== 1) return { code: null, ambiguous: codes.length > 1, note: text, warning: codes.length > 1 ? 'В разделе «Диагноз» несколько кодов. Диагноз выберите вручную.' : 'Кода в тексте нет: будет использован единственный диагноз из списка текущей медзаписи.' };
+    // Полная формулировка берётся из текущего раздела; медицинских констант нет.
+    const note = text.replace(/^[\s\u200B-\u200D\uFEFF]*[A-Za-z]\s*[-–—]?\s*\d{2}(?:[.,]\d{1,4})?\.?\s*[:\-–—]?\s*/, '').trim();
+    return { code: codes[0], note, warning: '' };
+  }
+  function gridRows(scope, id, needsCheckbox = false) {
+    const grid = one(scope, '#' + id + '[data-role="grid"]', 'Таблица диагнозов');
+    const headers = [...grid.querySelectorAll('thead th')];
+    const index = field => {
+      const matches = headers.flatMap((h, i) => h.getAttribute('data-field') === field ? [i] : []);
+      if (matches.length !== 1) fail('Колонка ' + field + ' не найдена однозначно. Диагноз заполните вручную.');
+      return matches[0];
+    };
+    const codeIndex = index('Code'), nameIndex = index('Name');
+    const noteIndex = needsCheckbox ? -1 : index('Note');
+    const rows = [...grid.querySelectorAll('tbody tr')].filter(row => row.closest('[data-role="grid"]') === grid && row.cells.length === headers.length);
+    return rows.map(row => ({ row, code: codeOf(row.cells[codeIndex].textContent), name: comparable(row.cells[nameIndex].textContent), noteCell: noteIndex < 0 ? null : row.cells[noteIndex], checkbox: needsCheckbox ? row.cells[0].querySelector('input[type="checkbox"]') : null })).filter(item => item.code);
+  }
+  function chooseDiagnosis(rows, code) {
+    if (!code && rows.length === 1) return rows[0];
+    const exact = rows.filter(r => r.code === code);
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) fail('Диагноз: несколько строк с одинаковым кодом. Выберите вручную.');
+    // Только уже существующий код той же категории; соседний подтип не подставляем.
+    const ancestors = /^[A-Z]\d{2}(?:\.\d+)?$/.test(code) ? rows.filter(r => /^[A-Z]\d{2}(?:\.\d+)?$/.test(r.code) && code.startsWith(r.code) && r.code.length < code.length) : [];
+    ancestors.sort((a, b) => b.code.length - a.code.length);
+    if (ancestors.length && (ancestors.length === 1 || ancestors[0].code.length > ancestors[1].code.length)) return ancestors[0];
+    fail('Диагноз: нет однозначного точного или более общего подходящего кода. Выберите вручную.');
+  }
+  async function addDiagnosis(old, info, noteText) {
+    if (info.ambiguous) return info.warning;
+    const form = checkContext(old).form;
+    let rows = gridRows(form, 'gDiagnoses'), selected;
+    if (rows.length) {
+      if (!info.code) return 'В форме уже есть диагноз. Он и примечание сохранены; проверьте вручную.';
+      selected = chooseDiagnosis(rows, info.code);
+      if (rows.length !== 1) fail('В форме уже несколько диагнозов. Они сохранены; примечание проверьте вручную.');
+    } else {
+      if ([...document.querySelectorAll('#fSelectionDiagnoses')].some(visible)) fail('Окно выбора диагноза уже открыто. Завершите его вручную.');
+      const plus = one(form, '#bDiagnosesAdd', 'Добавление диагноза');
+      if (!visible(plus) || !writable(plus) || plus.classList.contains('k-state-disabled')) fail('Кнопка «+ Диагноз» недоступна. Выберите диагноз вручную.');
+      let selectionForm = null, committed = false;
+      try {
+        plus.click();
+        selectionForm = await until(() => {
+          const forms = [...document.querySelectorAll('#fSelectionDiagnoses')].filter(visible);
+          return forms.length === 1 ? forms[0] : null;
+        }, old, 'Окно выбора диагноза');
+        rows = await until(() => {
+          const candidates = gridRows(selectionForm, 'gSelectionDiagnoses', true);
+          return candidates.length ? candidates : null;
+        }, old, 'Список диагнозов');
+        selected = chooseDiagnosis(rows, info.code);
+        if (!selected.checkbox || !writable(selected.checkbox)) fail('Флажок диагноза недоступен. Выберите вручную.');
+        if (rows.some(r => r !== selected && r.checkbox?.checked)) fail('Уже отмечен другой диагноз. Выбор оставлен для ручной проверки.');
+        checkContext(old);
+        if (gridRows(form, 'gDiagnoses').length) fail('Таблица назначения изменилась. Диагноз проверьте вручную.');
+        if (!selected.checkbox.checked) selected.checkbox.click();
+        if (!selected.checkbox.checked) fail('Выбор диагноза не применился. Выберите вручную.');
+        const checked = gridRows(selectionForm, 'gSelectionDiagnoses', true).filter(r => r.checkbox?.checked);
+        if (!selected.row.isConnected || checked.length !== 1 || checked[0].row !== selected.row) fail('Выбор диагноза изменился. Автоматическое добавление остановлено.');
+        const ok = one(selectionForm, '#bFormOk', 'Подтверждение выбора диагноза');
+        if (!writable(ok)) fail('Добавление диагноза недоступно. Выберите вручную.');
+        checkContext(old);
+        // Только кнопка вложенного выбора, НИКОГДА #fCommitteeDirection #bFormOk.
+        ok.click(); committed = true;
+        const expected = selected;
+        selected = await until(() => {
+          const actual = gridRows(form, 'gDiagnoses');
+          return actual.length === 1 && actual[0].code === expected.code && actual[0].name === expected.name ? actual[0] : null;
+        }, old, 'Добавленный диагноз');
+      } finally {
+        if (!committed && selectionForm?.isConnected && visible(selectionForm) && snapshot === old) {
+          const cancel = selectionForm.querySelectorAll('#bFormCancel');
+          if (cancel.length === 1) cancel[0].click();
+        }
+      }
+    }
+    checkContext(old);
+    if (!noteText.trim()) return 'Диагноз ' + selected.code + ' добавлен из списка медзаписи. Примечание пустое: при необходимости заполните вручную.';
+    const note = one(selected.noteCell, 'textarea.committee-diagnosis-note', 'Примечание диагноза');
+    if (!writable(note)) fail('Примечание недоступно. Диагноз оставлен в форме, проверьте вручную.');
+    const originalLength = noteText.length;
+    noteText = fitText(noteText, note.maxLength);
+    if (note.value !== '' && note.value !== noteText) return 'Диагноз уже есть; другое примечание сохранено. Проверьте его вручную.';
+    if (note.value !== noteText) {
+      Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set.call(note, noteText);
+      note.dispatchEvent(new Event('input', { bubbles: true }));
+      note.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    await until(() => note.isConnected && note.value === noteText, old, 'Примечание диагноза');
+    const actual = gridRows(form, 'gDiagnoses');
+    if (actual.length !== 1 || actual[0].code !== selected.code || actual[0].noteCell !== selected.noteCell) fail('Строка диагноза изменилась. Проверьте диагноз и примечание вручную.');
+    return 'Диагноз ' + selected.code + (!info.code ? ' (из списка медзаписи)' : selected.code === info.code ? '' : ' (доступный более общий код для ' + info.code + ')') + ': строка и примечание проверены.' + (originalLength > noteText.length ? ' Примечание обрезано до ' + noteText.length + ' символов.' : '');
+  }
+  async function fillExtras(old, info, noteText, report) {
+    for (const action of [() => firstContact(old, 'cmbPersonAddressID', 'Адрес'), () => firstContact(old, 'cmbContactPhone', 'Контактный телефон'), () => addDiagnosis(old, info, noteText)]) {
+      checkContext(old);
+      try { report.push(await action()); }
+      catch (error) { report.push(error.message); checkContext(old); }
+      message(report.join('\n') + '\nНаправление НЕ сохранено. После завершения закройте предпросмотр: заполненные поля останутся в форме, и можно нажать её «Сохранить» вручную.');
+    }
+  }
+
+  const fitText = (text, limit) => limit >= 0 ? text.slice(0, limit) : text;
+  function lengthIssues(inputs, values) {
+    return inputs.flatMap((el, i) => el.maxLength >= 0 && values[i].length > el.maxLength
+      ? [fields[i][1] + ': ' + values[i].length + ' из ' + el.maxLength + ' символов. Сократите на ' + (values[i].length - el.maxLength) + '.'] : []);
+  }
+  function addCounter(label, input, limit) {
+    if (limit >= 0) input.maxLength = limit;
+    const removed = input.value.length - fitText(input.value, limit).length;
+    input.value = fitText(input.value, limit);
+    const counter = document.createElement('span');
+    counter.setAttribute('aria-live', 'polite'); counter.className = 'vkk-length-counter'; label.append(counter);
+    const update = () => {
+      input.value = fitText(input.value, limit);
+      const over = limit >= 0 && input.value.length > limit;
+      counter.textContent = ' — ' + input.value.length + (limit >= 0 ? ' / ' + limit : '') + ' символов' + (removed ? '. Из исходного текста обрезано: ' + removed : '');
+      counter.style.color = over ? '#b00020' : '#425466';
+      input.setAttribute('aria-invalid', String(over));
+    };
+    input.addEventListener('input', update); update();
+  }
+
+  function checkManualSave(old) {
+    const form = checkContext(old).form;
+    const button = one(form, '#bFormOk', 'Сохранение');
+    const inputFields = checkContext(old).inputs;
+    const tooLong = lengthIssues(inputFields, inputFields.map(el => el.value));
+    if (tooLong.length) fail('Сохранению мешает превышение длины уже заполненных полей:\n' + tooLong.join('\n') + '\nСократите текст прямо в форме направления. Обработчик кнопки не изменён.');
+    // Только штатная проверка. Обработчики сохранения больше не изменяем.
+    const controls = window.committeeDirectionForm?.controls;
+    if (!controls || typeof controls.bFormOk?.self !== 'function' || typeof controls.fCommitteeDirection?.valid !== 'function') fail('Штатный API формы недоступен. Обработчик не изменён; сохранение не выполнялось.');
+    if (controls.fCommitteeDirection.self()[0] !== form || controls.bFormOk.self()[0] !== button) fail('Штатный обработчик относится к другой форме. Восстановление остановлено.');
+    const issues = [];
+    const address = controls.cmbPersonAddressID?.item();
+    const phone = controls.cmbContactPhone?.item();
+    if (!address || address.id == null || !String(address.id) || !address.Name) issues.push('Адрес: нет выбранного объекта в модели Damumed. Выберите вариант из списка.');
+    if (!phone || phone.ID == null || !String(phone.ID) || !phone.ContactText) issues.push('Телефон: нет выбранного объекта в модели Damumed. Выберите вариант из списка.');
+    if (!controls.gDiagnoses?.items()?.length) issues.push('Диагноз: модель таблицы пуста, даже если на экране есть текст. Добавьте диагноз штатным «+».');
+    if (!controls.fCommitteeDirection.valid()) issues.push('Проверка Damumed не пройдена. Проверьте причину направления и отмеченные поля.');
+    if (issues.length) fail(issues.join('\n') + '\nПроверки не обходились. Направление не отправлено.');
+    if (button.disabled || button.getAttribute('aria-disabled') === 'true') fail('Кнопка отключена самим Damumed. Принудительно включать её нельзя; обработчик не изменён.');
+    checkContext(old);
+    return 'Длины полей допустимы; адрес, телефон и диагноз присутствуют в модели; проверка Damumed пройдена.\nЗакройте предпросмотр и сохраните направление вручную. Обработчик кнопки не изменён; ничего не отправлено.';
+  }
+
+  const host = document.createElement('div'); host.id = 'local-vkk-helper';
+  const root = host.attachShadow({ mode: 'open' });
+  // Клавиатурные обработчики страницы не должны поглощать пробелы в редакторах.
+  // Default action сохраняется: ввод, выделение и сочетания клавиш работают штатно.
+  for (const type of ['keydown', 'keypress', 'keyup']) root.addEventListener(type, event => {
+    if (event.target instanceof HTMLTextAreaElement) event.stopPropagation();
+  });
+  const style = document.createElement('style');
+  style.textContent = ':host{position:fixed;right:40px;top:3px;z-index:2147483647;font:14px Arial;color:#172333}button{padding:6px 10px;cursor:pointer}button:disabled{cursor:default}#panel{position:fixed;right:18px;top:42px;background:white;border:2px solid #456;box-shadow:0 8px 35px #0005;border-radius:8px;padding:18px;width:min(680px,calc(100vw - 76px));max-height:calc(100vh - 105px);overflow:auto}textarea{display:block;box-sizing:border-box;width:100%;min-height:95px;margin:5px 0 14px;font:14px Arial}label{display:block;font-weight:bold}p{line-height:1.45}#status{white-space:pre-wrap}';
+  root.append(style);
+  const open = document.createElement('button'); open.textContent = 'ВКК: предпросмотр'; root.append(open);
+  document.documentElement.append(host);
+  // В реальной верхней панели оставляем отдельные 190 px, чтобы кнопка
+  // не лежала поверх вкладок. Никакие нижние кнопки Damumed не затрагиваются.
+  let dockedTabs = null;
+  const reserveTopSpace = () => {
+    const tabs = document.getElementById('MedRecEditorTabLinks');
+    if (tabs && tabs !== dockedTabs) {
+      dockedTabs = tabs;
+      tabs.style.setProperty('width', 'calc(100% - 190px)');
+      tabs.style.setProperty('box-sizing', 'border-box');
+    }
+  };
+  reserveTopSpace();
+  new MutationObserver(reserveTopSpace).observe(document.body, { childList: true, subtree: true });
+  let snapshot = null, panel = null, busy = false;
+  const close = () => { snapshot = null; panel?.remove(); panel = null; document.documentElement.append(host); open.hidden = false; open.disabled = busy; };
+  function message(text) { const status = root.querySelector('#status'); if (status) status.textContent = text; }
+  async function waitDom(read, label, timeout = 7000) {
+    const end = Date.now() + timeout;
+    do { const result = read(); if (result) return result; await new Promise(resolve => setTimeout(resolve, 100)); } while (Date.now() < end);
+    fail(label + ': результат не подтверждён. Откройте раздел и форму вручную.');
+  }
+  async function ensureCommitteeForm() {
+    const existing = [...document.querySelectorAll('[id="fCommitteeDirection"]')].filter(visible);
+    if (existing.length === 1) return 'Форма ВКК уже открыта.';
+    if (existing.length > 1) fail('Открыто несколько форм ВКК. Закройте лишние формы и повторите.');
+    const src = source();
+    const medRecId = src.body.id.replace(/^editor_/, '');
+    const selector = '#bCommitteeDirectionAdd_' + CSS.escape(medRecId);
+    const sectionLink = document.querySelector('#MedRecordPanelBar_' + CSS.escape(medRecId) + ' a[href*="/MedicalAdvisoryCommission/MedicalRecordCommitteeDirection"]') || [...document.querySelectorAll('a[href*="/MedicalAdvisoryCommission/MedicalRecordCommitteeDirection"]')].find(visible);
+    if (!sectionLink) fail('Раздел «Направления на комиссию» не найден. Откройте его вручную.');
+    message('Открываю раздел «Направления на комиссию»…');
+    if (!visible(document.querySelector(selector))) sectionLink.click();
+    const add = await waitDom(() => { const el = document.querySelector(selector); return el && visible(el) ? el : null; }, 'Кнопка «+» раздела ВКК');
+    if (!writable(add)) fail('Кнопка «+» направления ВКК недоступна. Откройте форму вручную.');
+    message('Открываю новую форму направления ВКК…');
+    add.click();
+    await waitDom(() => { const forms = [...document.querySelectorAll('[id="fCommitteeDirection"]')].filter(visible); return forms.length === 1 ? forms[0] : null; }, 'Открытие формы ВКК');
+    return 'Форма ВКК открыта штатной кнопкой «+».';
+  }
+  open.addEventListener('click', async () => {
+    close();
+    panel = document.createElement('section'); panel.id = 'panel'; panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-label', 'Предпросмотр переноса в ВКК');
+    root.append(panel); open.hidden = true;
+    const note = document.createElement('p'); note.textContent = 'Проверьте, что медзапись и открытое направление относятся к одному пациенту. Начальный блок может содержать преамбулу: отредактируйте жалобы. Скрипт не проверяет идентификатор пациента и не сохраняет направление.'; panel.append(note);
+    const status = document.createElement('p'); status.id = 'status'; status.setAttribute('role', 'status'); panel.append(status);
+    const dismiss = document.createElement('button'); dismiss.textContent = 'Закрыть и очистить предпросмотр'; dismiss.addEventListener('click', close); panel.append(dismiss);
+    const restore = document.createElement('button'); restore.textContent = 'Проверить готовность к сохранению';
+    restore.addEventListener('click', () => {
+      if (busy) { message('Дождитесь завершения заполнения перед проверкой сохранения.'); return; }
+      try { message(checkManualSave(snapshot)); }
+      catch (error) { message(error instanceof TypeError ? 'Структура штатного API изменилась. Восстановление не подтверждено; направление не отправлено.' : error.message); }
+    });
+    panel.insertBefore(restore, dismiss);
+    busy = true; open.disabled = true;
+    try {
+      message(await ensureCommitteeForm());
+      const src = source(), dst = target(), extracted = extract(src.text, true), values = extracted.values;
+      // Bootstrap удерживает фокус внутри .modal. Shadow host тоже должен
+      // находиться внутри реального диалога, иначе печать уходит из textarea.
+      dst.dialog.append(host);
+      snapshot = { src, dst, url: location.href };
+      const editors = fields.map(([, title], i) => {
+        const label = document.createElement('label'); label.textContent = title;
+        const input = document.createElement('textarea'); input.value = values[i]; addCounter(label, input, dst.inputs[i].maxLength); label.append(input); panel.insertBefore(label, status); return input;
+      });
+      const diagnosis = diagnosisInfo(extracted.diagnosis);
+      const diagnosisLabel = document.createElement('label'); diagnosisLabel.textContent = 'Примечание к диагнозу — текст из текущей записи в пределах лимита';
+      const diagnosisNote = document.createElement('textarea'); diagnosisNote.value = diagnosis.note; diagnosisNote.id = 'diagnosis-note-preview';
+      addCounter(diagnosisLabel, diagnosisNote, 800); diagnosisLabel.append(diagnosisNote); panel.insertBefore(diagnosisLabel, status);
+      const diagnosisHelp = document.createElement('p'); diagnosisHelp.textContent = diagnosis.warning || ('Код из раздела «Диагноз»: ' + diagnosis.code + '. Выбор из существующих диагнозов медзаписи: точный код или ближайший более общий код той же категории. Примечание: не более 800 символов.');
+      panel.insertBefore(diagnosisHelp, status);
+      const confirmLabel = document.createElement('label'), confirm = document.createElement('input'); confirm.type = 'checkbox';
+      confirmLabel.append(confirm, document.createTextNode('Проверил(а) пациента, четыре раздела и примечание к диагнозу')); panel.insertBefore(confirmLabel, status);
+      const fill = document.createElement('button'); fill.textContent = 'Заполнить открытую форму'; fill.disabled = true; panel.insertBefore(fill, dismiss);
+      confirm.addEventListener('change', () => { fill.disabled = busy || !confirm.checked; });
+      for (const input of [...editors, diagnosisNote]) input.addEventListener('input', () => { confirm.checked = false; fill.disabled = true; });
+      fill.addEventListener('click', async () => {
+        if (busy) return;
+        busy = true; fill.disabled = true;
+        const report = [];
+        try {
+          if (!snapshot || !confirm.checked) fail('Откройте предпросмотр заново и подтвердите проверку.');
+          const current = source(), dest = target(), old = snapshot;
+          if (location.href !== old.url || current.frame !== old.src.frame || current.body !== old.src.body || current.frameId !== old.src.frameId || current.bodyId !== old.src.bodyId || current.text !== old.src.text) fail('Медзапись изменилась. Закройте предпросмотр и откройте заново.');
+          if (dest.form !== old.dst.form || dest.dialog !== old.dst.dialog || dest.dialogId !== old.dst.dialogId || dest.inputs.some((el, i) => el !== old.dst.inputs[i])) fail('Форма направления изменилась. Откройте предпросмотр заново.');
+          const next = editors.map((el, i) => el.value === '' ? dest.inputs[i].value : fitText(el.value, dest.inputs[i].maxLength));
+          editors.forEach((el, i) => { if (el.value !== '' && el.value !== next[i]) { el.value = next[i]; report.push(fields[i][1] + ': обрезано до текущего лимита ' + next[i].length + '.'); } });
+          const conflicts = dest.inputs.flatMap((el, i) => el.value !== '' && el.value !== next[i] ? [fields[i][1]] : []);
+          if (conflicts.length) fail('Перезапись запрещена. Уже заполнены поля: ' + conflicts.join('; ') + '. Сверьте их вручную. Ни одно поле не изменено.');
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+          const changed = [];
+          dest.inputs.forEach((el, i) => { if (el.value !== next[i]) { setter.call(el, next[i]); changed.push(el); } });
+          for (const el of changed) { el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); }
+          if (dest.inputs.some((el, i) => !el.isConnected || el.value !== next[i])) fail('Форма изменила значения при обработке событий. Проверьте все поля вручную; часть текста могла быть перенесена.');
+          report.push('Четыре поля сверены и заполнены. ' + setReason(dest.form));
+          const noteText = diagnosisNote.value;
+          message(report.join('\n') + '\nПроверяю адрес, телефон и диагноз…');
+          await fillExtras(old, diagnosis, noteText, report);
+        } catch (error) { message([...report, error.message, 'Сохранение не выполнялось. Проверьте поля формы вручную.'].join('\n')); }
+        finally { busy = false; open.disabled = false; fill.disabled = !confirm.checked; }
+      });
+      message([...extracted.warnings, 'Предпросмотр можно редактировать. Пустые поля не переносятся. Текст автоматически обрезан по лимитам полей Damumed; исходная медзапись не меняется. Проверьте окончания разделов.'].join('\n'));
+    } catch (error) { message(error.message); busy = false; open.disabled = false; }
+    finally { busy = false; open.disabled = false; }
+  });
+  // Навигация назад/вперёд очищает временный текст; при SPA-смене источника
+  // или формы проверка также выполняется непосредственно перед переносом.
+  window.addEventListener('pagehide', close);
+  window.addEventListener('popstate', close);
+  window.addEventListener('hashchange', close);
+})();

@@ -1,0 +1,2125 @@
+// ==UserScript==
+// @name         Damumed — Перенос текста предыдущей записи AUTO
+// @namespace    damumed-transfer-previous-record
+// @version      1.6
+// @description  Автоматически загружает дерево записей и переносит текст последнего предыдущего приёма
+// @match        https://doc-ast.dmed.kz/MedicalRecords*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const PREFIX = '[Перенос записи]';
+
+    function log(...args) {
+        console.log(PREFIX, ...args);
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+
+    // =========================================================
+    // ТЕКУЩАЯ МЕДИЦИНСКАЯ ЗАПИСЬ
+    // =========================================================
+
+    function getCurrentMedRecordId() {
+
+        try {
+            const link = document.querySelector(
+                '#MedRecEditorTabLinks > li.active > a'
+            );
+
+            if (link) {
+                const id = link.getAttribute('data-medrecid');
+
+                if (id) {
+                    return String(id);
+                }
+            }
+
+        } catch (e) {
+            log(
+                'Ошибка поиска текущей записи:',
+                e
+            );
+        }
+
+
+        // Запасной вариант через iframe
+
+        const iframe = document.querySelector(
+            'iframe[id^="iframeMedRec_"]'
+        );
+
+        if (iframe) {
+
+            const match = iframe.id.match(
+                /^iframeMedRec_(\d+)$/
+            );
+
+            if (match) {
+                return match[1];
+            }
+        }
+
+        return null;
+    }
+
+
+    // =========================================================
+    // ТЕКУЩИЙ TINYEDITOR
+    // =========================================================
+
+    function getCurrentTinyEditor(id) {
+
+        if (!id) {
+            return null;
+        }
+
+        try {
+
+            if (
+                typeof TINY !== 'undefined' &&
+                TINY.editors &&
+                TINY.editors['editor_' + id]
+            ) {
+                return TINY.editors['editor_' + id];
+            }
+
+        } catch (e) {
+
+            log(
+                'Ошибка поиска TINY.editor:',
+                e
+            );
+
+        }
+
+        return null;
+    }
+
+
+    // =========================================================
+    // ДАТА
+    // =========================================================
+
+    function parseRecordDate(text) {
+
+        if (!text) {
+            return null;
+        }
+
+        const match = String(text).match(
+            /(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}):(\d{2})/
+        );
+
+        if (!match) {
+            return null;
+        }
+
+        const day = Number(match[1]);
+        const month = Number(match[2]) - 1;
+        const year = Number(match[3]);
+        const hour = Number(match[4]);
+        const minute = Number(match[5]);
+
+        return new Date(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            0,
+            0
+        );
+    }
+
+
+    // =========================================================
+    // ПОЛУЧАЕМ KENDO TREEVIEW
+    // =========================================================
+
+    function getTreeView() {
+
+        const treeElement =
+            document.querySelector(
+                '#MedRecordsTreeView'
+            );
+
+        if (!treeElement) {
+            return null;
+        }
+
+        try {
+
+            if (
+                typeof jQuery !== 'undefined' &&
+                jQuery.fn &&
+                jQuery.fn.data
+            ) {
+
+                const tree =
+                    jQuery(treeElement)
+                        .data('kendoTreeView');
+
+                if (tree) {
+                    return tree;
+                }
+            }
+
+        } catch (e) {
+
+            log(
+                'Ошибка получения Kendo TreeView:',
+                e
+            );
+
+        }
+
+        return null;
+    }
+
+
+    // =========================================================
+    // АВТОМАТИЧЕСКИ РАСКРЫВАЕМ РОДИТЕЛЕЙ ТЕКУЩЕЙ ЗАПИСИ
+    // =========================================================
+
+    async function expandCurrentRecordParents(
+        currentId
+    ) {
+
+        const treeElement =
+            document.querySelector(
+                '#MedRecordsTreeView'
+            );
+
+        if (!treeElement) {
+            return;
+        }
+
+        const currentFile =
+            treeElement.querySelector(
+                '.file[data-id="' +
+                CSS.escape(String(currentId)) +
+                '"]'
+            );
+
+        if (!currentFile) {
+
+            log(
+                '⚠ Текущая запись пока отсутствует в дереве'
+            );
+
+            return;
+        }
+
+        let parent = currentFile.parentElement;
+
+        while (parent) {
+
+            if (
+                parent.matches &&
+                parent.matches('li.k-item') &&
+                parent.querySelector('.med-records-loader')
+            ) {
+                break;
+            }
+
+            parent = parent.parentElement;
+        }
+
+        if (!parent) {
+            log('⚠ Не найден родительский период текущей записи');
+            return;
+        }
+
+        const label =
+            String(parent.textContent || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+        log(
+            '✓ Родительский период текущей записи:',
+            label
+        );
+
+        // После AJAX DMED может полностью заменить <li> периода.
+        // Поэтому после каждого клика заново ищем период по названию.
+
+        const findLivePeriod = () => {
+
+            const tree =
+                document.querySelector(
+                    '#MedRecordsTreeView'
+                );
+
+            if (!tree) {
+                return null;
+            }
+
+            const periods =
+                Array.from(
+                    tree.querySelectorAll(
+                        'li.k-item:has(.med-records-loader)'
+                    )
+                );
+
+            return periods.find(
+                item =>
+                    String(item.textContent || '')
+                        .replace(/\s+/g, ' ')
+                        .trim() === label
+            ) || null;
+        };
+
+
+        const getRecords = item => {
+
+            if (!item) {
+                return [];
+            }
+
+            const group =
+                item.querySelector(
+                    ':scope > .k-group'
+                );
+
+            return group
+                ? Array.from(
+                    group.querySelectorAll(
+                        ':scope > li.file[data-id]'
+                    )
+                )
+                : [];
+        };
+
+
+        const isExpanded = item => {
+
+            if (!item) {
+                return false;
+            }
+
+            const aria =
+                item.getAttribute(
+                    'aria-expanded'
+                );
+
+            if (aria === 'true') {
+                return true;
+            }
+
+            if (aria === 'false') {
+                return false;
+            }
+
+            if (
+                item.classList.contains(
+                    'k-state-expanded'
+                )
+            ) {
+                return true;
+            }
+
+            if (
+                item.classList.contains(
+                    'k-state-collapsed'
+                )
+            ) {
+                return false;
+            }
+
+            const group =
+                item.querySelector(
+                    ':scope > .k-group'
+                );
+
+            return (
+                !!group &&
+                String(
+                    group.style.display || ''
+                )
+                    .toLowerCase() !== 'none'
+            );
+        };
+
+
+        const getClickable = item =>
+            item &&
+            item.querySelector(
+                ':scope > .k-top .k-in, :scope > .k-mid .k-in, :scope > .k-bot .k-in'
+            );
+
+
+        let live =
+            findLivePeriod();
+
+        if (!live) {
+
+            log(
+                '⚠ Период текущей записи исчез из дерева:',
+                label
+            );
+
+            return;
+        }
+
+
+        let records =
+            getRecords(live);
+
+        let expanded =
+            isExpanded(live);
+
+
+        log(
+            '→ Период:',
+            label,
+            '| раскрыт:',
+            expanded,
+            '| записей в DOM:',
+            records.length
+        );
+
+
+        // =========================================================
+        // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
+        // =========================================================
+        //
+        // Если период открыт, но в нём только одна запись,
+        // это НЕ означает, что период полностью загружен.
+        //
+        // В нашем случае DMED показывает текущую запись,
+        // а остальные записи появляются только после повторного
+        // закрытия и открытия периода.
+        // =========================================================
+
+        if (
+            expanded &&
+            records.length <= 1
+        ) {
+
+            log(
+                '→ В периоде только текущая запись.'
+            );
+
+            log(
+                '→ Перезапускаем штатную загрузку периода:',
+                label
+            );
+
+
+            // -----------------------------------------------------
+            // 1. Получаем АКТУАЛЬНЫЙ .k-in
+            // -----------------------------------------------------
+
+            let clickable =
+                getClickable(live);
+
+            if (!clickable) {
+
+                log(
+                    '⚠ Не найден .k-in для периода:',
+                    label
+                );
+
+                return;
+            }
+
+
+            // -----------------------------------------------------
+            // 2. Закрываем период
+            // -----------------------------------------------------
+
+            try {
+
+                log(
+                    '→ Закрываем период:',
+                    label
+                );
+
+                clickable.click();
+
+            } catch (e) {
+
+                log(
+                    '⚠ Ошибка закрытия периода:',
+                    e
+                );
+
+                return;
+            }
+
+
+            // -----------------------------------------------------
+            // 3. Ждём реального закрытия
+            //
+            // ВАЖНО:
+            // каждый раз ищем новый DOM-элемент.
+            // Старый parent после AJAX больше не используем.
+            // -----------------------------------------------------
+
+            let collapsed = false;
+
+            for (
+                let attempt = 0;
+                attempt < 40;
+                attempt++
+            ) {
+
+                live =
+                    findLivePeriod();
+
+                if (
+                    live &&
+                    !isExpanded(live)
+                ) {
+
+                    collapsed = true;
+                    break;
+                }
+
+                await sleep(100);
+            }
+
+
+            if (!collapsed) {
+
+                log(
+                    '⚠ Период не перешёл в свернутое состояние:',
+                    label
+                );
+
+            } else {
+
+                log(
+                    '✓ Период действительно свернулся:',
+                    label
+                );
+
+            }
+
+
+            // -----------------------------------------------------
+            // 4. ЗАНОВО получаем период после закрытия
+            // -----------------------------------------------------
+
+            live =
+                findLivePeriod();
+
+            if (!live) {
+
+                log(
+                    '⚠ После закрытия период не найден:',
+                    label
+                );
+
+                return;
+            }
+
+
+            clickable =
+                getClickable(live);
+
+            if (!clickable) {
+
+                log(
+                    '⚠ После закрытия .k-in не найден:',
+                    label
+                );
+
+                return;
+            }
+
+
+            // -----------------------------------------------------
+            // 5. Снова открываем
+            // -----------------------------------------------------
+
+            log(
+                '→ Снова открываем период штатным кликом:',
+                label
+            );
+
+            try {
+
+                clickable.click();
+
+            } catch (e) {
+
+                log(
+                    '⚠ Ошибка повторного открытия периода:',
+                    e
+                );
+
+                return;
+            }
+
+
+            // -----------------------------------------------------
+            // 6. Ждём появления дополнительных записей
+            //
+            // Здесь мы уже не просто ждём фиксированные 700 мс.
+            // Постоянно заново читаем DOM.
+            // -----------------------------------------------------
+
+            for (
+                let attempt = 0;
+                attempt < 60;
+                attempt++
+            ) {
+
+                live =
+                    findLivePeriod();
+
+                records =
+                    getRecords(live);
+
+                if (
+                    records.length > 1
+                ) {
+
+                    log(
+                        '✓ Содержимое периода догружено:',
+                        label,
+                        '| записей:',
+                        records.length
+                    );
+
+                    return;
+                }
+
+                await sleep(250);
+            }
+
+
+            log(
+                '⚠ После повторного открытия дополнительные записи не появились:',
+                label
+            );
+
+            return;
+        }
+
+
+        // =========================================================
+        // ЕСЛИ ПЕРИОД УЖЕ НОРМАЛЬНО ЗАГРУЖЕН
+        // =========================================================
+
+        if (
+            expanded &&
+            records.length > 1
+        ) {
+
+            log(
+                '✓ Текущий период уже загружен и содержит',
+                records.length,
+                'записей'
+            );
+
+            return;
+        }
+
+
+        // =========================================================
+        // ЕСЛИ ПЕРИОД БЫЛ ЗАКРЫТ
+        // =========================================================
+
+        const clickable =
+            getClickable(live);
+
+        if (!clickable) {
+
+            log(
+                '⚠ Не найден элемент для раскрытия текущего периода'
+            );
+
+            return;
+        }
+
+
+        log(
+            '→ Штатно кликаем текущий период'
+        );
+
+        try {
+
+            clickable.click();
+
+        } catch (e) {
+
+            log(
+                '⚠ Ошибка клика по текущему периоду:',
+                e
+            );
+
+        }
+
+
+        // Ждём появления содержимого.
+
+        for (
+            let attempt = 0;
+            attempt < 60;
+            attempt++
+        ) {
+
+            live =
+                findLivePeriod();
+
+            records =
+                getRecords(live);
+
+            if (
+                records.length > 0
+            ) {
+                break;
+            }
+
+            await sleep(250);
+        }
+    }
+
+
+    // =========================================================
+    // ПОЛУЧАЕМ ЗАПИСИ ИЗ ДЕРЕВА
+    // =========================================================
+
+    function getRecordNodes() {
+
+        const tree =
+            document.querySelector(
+                '#MedRecordsTreeView'
+            );
+
+        if (!tree) {
+
+            log(
+                'Дерево #MedRecordsTreeView не найдено'
+            );
+
+            return [];
+        }
+
+        const nodes = [];
+
+        tree.querySelectorAll(
+            'li.file[data-id]'
+        ).forEach(
+            function (li) {
+
+                const id =
+                    li.getAttribute(
+                        'data-id'
+                    );
+
+                if (!id) {
+                    return;
+                }
+
+                const text =
+                    String(
+                        li.textContent || ''
+                    )
+                    .replace(
+                        /\s+/g,
+                        ' '
+                    )
+                    .trim();
+
+                const date =
+                    parseRecordDate(
+                        text
+                    );
+
+                if (!date) {
+                    return;
+                }
+
+                nodes.push({
+                    id: String(id),
+                    text: text,
+                    date: date,
+                    element: li
+                });
+
+            }
+        );
+
+        log(
+            'Найдено записей в дереве:',
+            nodes.length
+        );
+
+        return nodes;
+    }
+
+
+    // =========================================================
+    // ПОПЫТКА НАЙТИ ПРЕДЫДУЩУЮ
+    // =========================================================
+
+    function tryFindPreviousRecord(
+        currentId
+    ) {
+
+        const records =
+            getRecordNodes();
+
+        if (!records.length) {
+            return null;
+        }
+
+        const current =
+            records.find(
+                item =>
+                    String(item.id) ===
+                    String(currentId)
+            );
+
+        if (!current) {
+            return null;
+        }
+
+        const previous =
+            records
+                .filter(
+                    item =>
+                        String(item.id) !==
+                            String(currentId) &&
+                        item.date <
+                            current.date
+                )
+                .sort(
+                    (a, b) =>
+                        b.date - a.date
+                )[0];
+
+        if (!previous) {
+            return null;
+        }
+
+        return {
+            current: current,
+            previous: previous
+        };
+    }
+
+
+    // =========================================================
+    // АВТОМАТИЧЕСКИ ЗАГРУЖАЕМ ДЕРЕВО
+    // =========================================================
+
+    async function loadRecordsTree(
+        currentId
+    ) {
+
+        log(
+            '→ Начинаем автоматический поиск предыдущей записи'
+        );
+
+        let tree =
+            document.querySelector(
+                '#MedRecordsTreeView'
+            );
+
+        // Если само дерево ещё не существует,
+        // открываем список медицинских записей.
+
+        if (!tree) {
+
+            log(
+                '→ Дерево отсутствует'
+            );
+
+            try {
+
+                if (
+                    typeof window.showMedicalRecordsList ===
+                    'function'
+                ) {
+
+                    log(
+                        '→ Вызываем штатную showMedicalRecordsList()'
+                    );
+
+                    window.showMedicalRecordsList();
+
+                }
+
+            } catch (e) {
+
+                log(
+                    '⚠ showMedicalRecordsList:',
+                    e
+                );
+
+            }
+
+
+            // Дополнительная попытка через кнопку
+
+            await sleep(500);
+
+            tree =
+                document.querySelector(
+                    '#MedRecordsTreeView'
+                );
+
+            if (!tree) {
+
+                const elements =
+                    Array.from(
+                        document.querySelectorAll(
+                            'a, button, span, div'
+                        )
+                    );
+
+                const target =
+                    elements.find(
+                        el =>
+                            String(
+                                el.textContent || ''
+                            )
+                            .replace(/\s+/g, ' ')
+                            .trim()
+                            .toLowerCase()
+                            === 'все записи'
+                    );
+
+                if (target) {
+
+                    log(
+                        '→ Нажимаем "Все записи"'
+                    );
+
+                    try {
+                        target.click();
+                    } catch (e) {
+                        log(
+                            '⚠ Кнопка "Все записи":',
+                            e
+                        );
+                    }
+
+                }
+
+            }
+
+        }
+
+
+        // Ждём появления дерева
+
+        for (
+            let i = 0;
+            i < 40;
+            i++
+        ) {
+
+            tree =
+                document.querySelector(
+                    '#MedRecordsTreeView'
+                );
+
+            if (tree) {
+                break;
+            }
+
+            await sleep(250);
+        }
+
+        if (!tree) {
+
+            throw new Error(
+                'Дерево медицинских записей не появилось.'
+            );
+
+        }
+
+        log(
+            '✓ Дерево найдено'
+        );
+
+
+        // Сначала раскрываем именно период текущей записи.
+
+        await expandCurrentRecordParents(
+            currentId
+        );
+
+
+        // Проверяем, не появилась ли предыдущая запись
+        // после загрузки текущего периода.
+
+        for (
+            let attempt = 0;
+            attempt < 20;
+            attempt++
+        ) {
+
+            const found =
+                tryFindPreviousRecord(
+                    currentId
+                );
+
+            if (found) {
+
+                log(
+                    '✓ Предыдущая запись найдена автоматически:',
+                    found.previous.id
+                );
+
+                return found;
+            }
+
+            await sleep(250);
+        }
+
+
+        // =====================================================
+        // ИДЁМ ПО ПЕРИОДАМ ДЕРЕВА
+        // =====================================================
+
+        // ВАЖНО:
+        // список периодов получаем заново после каждой загрузки,
+        // потому что DMED может перерисовать дерево после AJAX.
+
+        let loaders =
+            Array.from(
+                tree.querySelectorAll(
+                    'li.k-item:has(.med-records-loader)'
+                )
+            );
+
+        if (!loaders.length) {
+
+            log(
+                '⚠ В дереве не найдены периоды для загрузки'
+            );
+
+        }
+
+        log(
+            'Периодов в дереве:',
+            loaders.length
+        );
+
+
+        // Находим период текущей записи.
+
+        const currentFile =
+            tree.querySelector(
+                '.file[data-id="' +
+                CSS.escape(String(currentId)) +
+                '"]'
+            );
+
+        let currentPeriod = null;
+
+        if (currentFile) {
+
+            let node =
+                currentFile.parentElement;
+
+            while (node) {
+
+                if (
+                    node.matches &&
+                    node.matches('li.k-item') &&
+                    node.querySelector('.med-records-loader')
+                ) {
+
+                    currentPeriod = node;
+                    break;
+                }
+
+                node =
+                    node.parentElement;
+            }
+        }
+
+
+        let startIndex = 0;
+
+        if (currentPeriod) {
+
+            const index =
+                loaders.indexOf(
+                    currentPeriod
+                );
+
+            if (index >= 0) {
+                startIndex = index;
+            }
+        }
+
+
+        // Периоды в DMED идут от новых к старым.
+
+        for (
+            let i = startIndex;
+            i < loaders.length;
+            i++
+        ) {
+
+            // Каждый раз заново получаем список периодов.
+
+            loaders =
+                Array.from(
+                    tree.querySelectorAll(
+                        'li.k-item:has(.med-records-loader)'
+                    )
+                );
+
+            if (
+                i >= loaders.length
+            ) {
+                break;
+            }
+
+            const item =
+                loaders[i];
+
+            try {
+
+                const label =
+                    String(
+                        item.textContent || ''
+                    )
+                    .replace(
+                        /\s+/g,
+                        ' '
+                    )
+                    .trim();
+
+
+                // -------------------------------------------------
+                // Сначала проверяем, не нашлась ли предыдущая запись
+                // уже в текущем состоянии дерева.
+                // -------------------------------------------------
+
+                let found =
+                    tryFindPreviousRecord(
+                        currentId
+                    );
+
+                if (found) {
+
+                    log(
+                        '✓ Предыдущая запись уже найдена:',
+                        found.previous.id
+                    );
+
+                    return found;
+                }
+
+
+                // -------------------------------------------------
+                // Определяем состояние периода.
+                // -------------------------------------------------
+
+                const group =
+                    item.querySelector(
+                        ':scope > .k-group'
+                    );
+
+                const isExpanded =
+                    group &&
+                    String(
+                        group.style.display || ''
+                    )
+                    .toLowerCase() !== 'none';
+
+
+                // -------------------------------------------------
+                // Если период закрыт — открываем.
+                // -------------------------------------------------
+
+                if (!isExpanded) {
+
+                    const clickable =
+                        item.querySelector(
+                            ':scope > .k-top .k-in, :scope > .k-mid .k-in, :scope > .k-bot .k-in'
+                        );
+
+                    if (!clickable) {
+
+                        log(
+                            '⚠ Не найден .k-in для периода:',
+                            label
+                        );
+
+                        continue;
+                    }
+
+
+                    log(
+                        '→ Штатно кликаем период:',
+                        label
+                    );
+
+
+                    clickable.click();
+
+                } else {
+
+                    // -------------------------------------------------
+                    // Если период открыт, но в нём только одна запись,
+                    // это может быть только текущая запись.
+                    //
+                    // Поэтому запускаем его повторную загрузку.
+                    // -------------------------------------------------
+
+                    const periodRecords =
+                        group
+                            ? Array.from(
+                                group.querySelectorAll(
+                                    ':scope > li.file[data-id]'
+                                )
+                            )
+                            : [];
+
+                    if (
+                        periodRecords.length <= 1
+                    ) {
+
+                        log(
+                            '→ Период открыт, но содержит только',
+                            periodRecords.length,
+                            'запись:',
+                            label
+                        );
+
+
+                        const clickable =
+                            item.querySelector(
+                                ':scope > .k-top .k-in, :scope > .k-mid .k-in, :scope > .k-bot .k-in'
+                            );
+
+                        if (clickable) {
+
+                            // Закрываем.
+
+                            log(
+                                '→ Закрываем период:',
+                                label
+                            );
+
+                            clickable.click();
+
+
+                            // Ждём закрытия.
+
+                            for (
+                                let attempt = 0;
+                                attempt < 40;
+                                attempt++
+                            ) {
+
+                                await sleep(100);
+
+                                const livePeriods =
+                                    Array.from(
+                                        tree.querySelectorAll(
+                                            'li.k-item:has(.med-records-loader)'
+                                        )
+                                    );
+
+                                const livePeriod =
+                                    livePeriods.find(
+                                        p =>
+                                            String(
+                                                p.textContent || ''
+                                            )
+                                            .replace(/\s+/g, ' ')
+                                            .trim() === label
+                                    );
+
+                                if (
+                                    livePeriod &&
+                                    !(
+                                        livePeriod.getAttribute(
+                                            'aria-expanded'
+                                        ) === 'true'
+                                    )
+                                ) {
+                                    break;
+                                }
+                            }
+
+
+                            // Заново находим период.
+
+                            const livePeriods =
+                                Array.from(
+                                    tree.querySelectorAll(
+                                        'li.k-item:has(.med-records-loader)'
+                                    )
+                                );
+
+                            const livePeriod =
+                                livePeriods.find(
+                                    p =>
+                                        String(
+                                            p.textContent || ''
+                                        )
+                                        .replace(/\s+/g, ' ')
+                                        .trim() === label
+                                );
+
+
+                            if (livePeriod) {
+
+                                const reopened =
+                                    livePeriod.querySelector(
+                                        ':scope > .k-top .k-in, :scope > .k-mid .k-in, :scope > .k-bot .k-in'
+                                    );
+
+                                if (reopened) {
+
+                                    log(
+                                        '→ Повторно открываем период:',
+                                        label
+                                    );
+
+                                    reopened.click();
+
+                                }
+                            }
+
+                        }
+
+                    } else {
+
+                        log(
+                            '→ Период уже раскрыт:',
+                            label,
+                            '| записей:',
+                            periodRecords.length
+                        );
+
+                    }
+                }
+
+
+                // -------------------------------------------------
+                // Ждём AJAX.
+                // -------------------------------------------------
+
+                for (
+                    let attempt = 0;
+                    attempt < 40;
+                    attempt++
+                ) {
+
+                    found =
+                        tryFindPreviousRecord(
+                            currentId
+                        );
+
+                    if (found) {
+
+                        log(
+                            '✓ Предыдущая запись найдена в периоде:',
+                            label
+                        );
+
+                        return found;
+                    }
+
+                    await sleep(250);
+                }
+
+
+            } catch (e) {
+
+                log(
+                    '⚠ Ошибка раскрытия периода:',
+                    e
+                );
+
+            }
+        }
+
+
+        // =========================================================
+        // ПОСЛЕДНЯЯ ПРОВЕРКА
+        // =========================================================
+
+        for (
+            let attempt = 0;
+            attempt < 12;
+            attempt++
+        ) {
+
+            const found =
+                tryFindPreviousRecord(
+                    currentId
+                );
+
+            if (found) {
+                return found;
+            }
+
+            await sleep(250);
+        }
+
+
+        return null;
+
+    }
+
+
+    // =========================================================
+    // ПОЛУЧАЕМ HTML ПРЕДЫДУЩЕЙ ЗАПИСИ
+    // =========================================================
+
+    async function fetchPreviousRecordHtml(
+        previousId
+    ) {
+
+        log(
+            '→ Получаем MedRecordEditor:',
+            previousId
+        );
+
+        const response =
+            await fetch(
+                '/MedicalRecords/MedRecordEditor',
+                {
+                    method: 'POST',
+
+                    credentials:
+                        'same-origin',
+
+                    headers: {
+                        'Content-Type':
+                            'application/x-www-form-urlencoded; charset=UTF-8'
+                    },
+
+                    body:
+                        'MedRecordID=' +
+                        encodeURIComponent(
+                            previousId
+                        )
+                }
+            );
+
+        if (!response.ok) {
+
+            throw new Error(
+                'MedRecordEditor вернул HTTP ' +
+                response.status
+            );
+
+        }
+
+        const html =
+            await response.text();
+
+        if (
+            !html ||
+            !html.trim()
+        ) {
+
+            throw new Error(
+                'MedRecordEditor вернул пустой ответ.'
+            );
+
+        }
+
+        return html;
+    }
+
+
+    // =========================================================
+    // ИЗВЛЕКАЕМ ТЕКСТ
+    // =========================================================
+
+    function extractPreviousText(
+        html
+    ) {
+
+        const parser =
+            new DOMParser();
+
+        const doc =
+            parser.parseFromString(
+                html,
+                'text/html'
+            );
+
+        const textareas =
+            Array.from(
+                doc.querySelectorAll(
+                    'textarea[id^="tinyeditor_"]'
+                )
+            );
+
+        if (!textareas.length) {
+
+            throw new Error(
+                'В ответе MedRecordEditor не найден textarea предыдущей записи.'
+            );
+
+        }
+
+        const textarea =
+            textareas[0];
+
+        const value =
+            textarea.value || '';
+
+        if (!value.trim()) {
+
+            throw new Error(
+                'Textarea предыдущей записи найден, но пустой.'
+            );
+
+        }
+
+        log(
+            '✓ Текст предыдущей записи получен.',
+            'Символов:',
+            value.length
+        );
+
+        return value;
+    }
+
+
+    // =========================================================
+    // ВСТАВКА В ТЕКУЩИЙ TINYEDITOR
+    // =========================================================
+
+
+async function insertIntoCurrentEditor(
+    currentId,
+    html
+) {
+
+    log(
+        '→ Ищем текущий TinyEditor:',
+        'editor_' + currentId
+    );
+
+    let editor = null;
+
+    for (let i = 0; i < 40; i++) {
+
+        editor =
+            getCurrentTinyEditor(
+                currentId
+            );
+
+        if (editor) {
+            break;
+        }
+
+        await sleep(250);
+    }
+
+    if (!editor) {
+
+        throw new Error(
+            'Текущий TinyEditor не найден: editor_' +
+            currentId
+        );
+    }
+
+    log(
+        '✓ Текущий TinyEditor найден:',
+        'editor_' + currentId
+    );
+
+
+    // =========================================================
+    // Получаем document TinyEditor
+    // =========================================================
+
+    const iframeDoc = editor.e;
+
+    if (!iframeDoc) {
+
+        throw new Error(
+            'TinyEditor найден, но editor.e не содержит document.'
+        );
+    }
+
+    log(
+        '✓ Document TinyEditor получен через editor.e'
+    );
+
+
+    // =========================================================
+    // Получаем body
+    // =========================================================
+
+    const body =
+        iframeDoc.getElementById(
+            editor.obj.bodyid
+        ) ||
+        iframeDoc.querySelector('body');
+
+    if (!body) {
+
+        throw new Error(
+            'Body TinyEditor не найден.'
+        );
+    }
+
+    log(
+        '✓ Body TinyEditor найден'
+    );
+
+
+    // =========================================================
+    // 1. Очищаем старое содержимое
+    // =========================================================
+
+    body.innerHTML = '';
+
+    if (editor.t) {
+
+        editor.t.value = '';
+
+    }
+
+
+    // =========================================================
+    // 2. Вставляем HTML непосредственно в body
+    // =========================================================
+
+    body.innerHTML = html;
+
+    log(
+        '✓ HTML вставлен непосредственно в body TinyEditor'
+    );
+
+
+    // =========================================================
+    // 3. Синхронизируем textarea
+    // =========================================================
+
+    if (editor.t) {
+
+        editor.t.value = html;
+
+        log(
+            '✓ Textarea синхронизирован:',
+            editor.t.id
+        );
+
+        editor.t.dispatchEvent(
+            new Event(
+                'input',
+                {
+                    bubbles: true
+                }
+            )
+        );
+
+        editor.t.dispatchEvent(
+            new Event(
+                'change',
+                {
+                    bubbles: true
+                }
+            )
+        );
+    }
+
+
+    // =========================================================
+    // 4. Даем DMED/TinyEditor время обработать изменение
+    // =========================================================
+
+    await sleep(300);
+
+
+    log(
+        '✓ Текст предыдущей записи вставлен'
+    );
+
+// ---------------------------------------------------------
+// 5. Запускаем штатное сохранение DMED
+// ---------------------------------------------------------
+
+try {
+
+    const medicalRecord =
+        MedicalRecords['md_' + currentId];
+
+    if (!medicalRecord) {
+
+        throw new Error(
+            'MedicalRecords для текущей записи не найден: md_' +
+            currentId
+        );
+    }
+
+    log(
+        '→ Запускаем штатное сохранение текущей записи'
+    );
+
+    await medicalRecord.saveMedicalRecordDocumentText();
+
+    log(
+        '✓ Штатное сохранение текущей записи завершено'
+    );
+await sleep(500);
+
+const currentRecord = document.querySelector(
+    '[onclick="loadMedicalRecord(\'' + currentId + '\',\'25\')"]'
+);
+
+if (currentRecord) {
+    log('→ Повторно открываем текущую запись через дерево:', currentId);
+
+    currentRecord.click();
+
+    await sleep(700);
+
+    log('✓ Текущая запись снова открыта через дерево');
+}
+} catch (e) {
+
+    log(
+        '⚠ Ошибка штатного сохранения:',
+        e
+    );
+
+           throw e;
+    }
+}
+
+// =========================================================
+// АВТОМАТИЧЕСКИ РАСШИРЯЕМ ДИАПАЗОН ДАТ
+// =========================================================
+
+async function prepareDateRangeForPreviousRecord(currentId) {
+
+    log('→ Подготавливаем диапазон дат для поиска предыдущей записи');
+
+    const beginInput = document.getElementById('CriterionBeginDate');
+    const endInput = document.getElementById('CriterionEndDate');
+
+    if (!beginInput || !endInput) {
+        log('⚠ Поля календаря не найдены');
+        return;
+    }
+
+    // Получаем дату текущей записи
+    let currentDate = null;
+
+    try {
+        const tree = document.querySelector('#MedRecordsTreeView');
+
+        if (tree && currentId) {
+
+            const currentFile = tree.querySelector(
+                '.file[data-id="' +
+                CSS.escape(String(currentId)) +
+                '"]'
+            );
+
+            if (currentFile) {
+
+                const text = String(
+                    currentFile.textContent || ''
+                ).replace(/\s+/g, ' ').trim();
+
+                currentDate = parseRecordDate(text);
+            }
+        }
+    } catch (e) {
+        log('⚠ Не удалось получить дату текущей записи:', e);
+    }
+
+    // Если дату из дерева получить не удалось —
+    // используем сегодняшнюю дату.
+    if (!currentDate) {
+        currentDate = new Date();
+    }
+
+    // Начинаем поиск с 5 лет назад.
+    const beginDate = new Date(currentDate);
+    beginDate.setFullYear(
+        beginDate.getFullYear() - 5
+    );
+
+    const endDate = new Date(currentDate);
+
+    log(
+        '→ Новый диапазон:',
+        beginDate.toLocaleDateString('ru-RU'),
+        '—',
+        endDate.toLocaleDateString('ru-RU')
+    );
+
+    // ---------------------------------------------------------
+    // Получаем Kendo DatePicker
+    // ---------------------------------------------------------
+
+    let beginPicker = null;
+    let endPicker = null;
+
+    try {
+
+        if (
+            typeof jQuery !== 'undefined' &&
+            jQuery.fn &&
+            jQuery.fn.data
+        ) {
+
+            beginPicker =
+                jQuery(beginInput)
+                    .data('kendoDatePicker');
+
+            endPicker =
+                jQuery(endInput)
+                    .data('kendoDatePicker');
+        }
+
+    } catch (e) {
+
+        log(
+            '⚠ Ошибка получения Kendo DatePicker:',
+            e
+        );
+    }
+
+    if (!beginPicker || !endPicker) {
+
+        log(
+            '⚠ Kendo DatePicker не найден'
+        );
+
+        return;
+    }
+
+    // ---------------------------------------------------------
+    // Меняем даты через API Kendo
+    // ---------------------------------------------------------
+
+    try {
+
+        beginPicker.value(beginDate);
+        endPicker.value(endDate);
+
+        // Сообщаем DMED, что значения реально изменились.
+        beginPicker.trigger('change');
+        endPicker.trigger('change');
+
+        // Дополнительно уведомляем обычные DOM-события.
+        jQuery(beginInput).trigger('change');
+        jQuery(endInput).trigger('change');
+
+    } catch (e) {
+
+        log(
+            '⚠ Ошибка изменения диапазона дат:',
+            e
+        );
+
+        return;
+    }
+
+    log(
+        '✓ Диапазон дат установлен'
+    );
+
+    // ---------------------------------------------------------
+    // Ждём, пока DMED обновит дерево
+    // ---------------------------------------------------------
+
+    await sleep(500);
+
+    for (let attempt = 0; attempt < 40; attempt++) {
+
+        const tree =
+            document.querySelector(
+                '#MedRecordsTreeView'
+            );
+
+        if (tree) {
+
+            const records =
+                tree.querySelectorAll(
+                    'li.file[data-id]'
+                );
+
+            if (records.length > 0) {
+
+                log(
+                    '✓ Дерево обновилось:',
+                    'записей в DOM =',
+                    records.length
+                );
+
+                return;
+            }
+        }
+
+        await sleep(250);
+    }
+
+    log(
+        '⚠ Дерево после изменения диапазона не подтвердило загрузку записей'
+    );
+}
+    // =========================================================
+    // ОСНОВНАЯ ФУНКЦИЯ
+    // =========================================================
+
+    async function transferPreviousRecord() {
+
+        try {
+
+            const currentId =
+                getCurrentMedRecordId();
+
+            if (!currentId) {
+
+                throw new Error(
+                    'Не удалось определить ID текущей медицинской записи.'
+                );
+
+            }
+
+            log(
+                'Текущая запись:',
+                currentId
+            );
+
+
+           // Автоматически расширяем диапазон календаря,
+// чтобы предыдущие даты стали доступны.
+
+await prepareDateRangeForPreviousRecord(
+    currentId
+);
+
+// Автоматически загружаем/раскрываем дерево
+
+const pair =
+    await loadRecordsTree(
+        currentId
+    );
+
+            if (!pair) {
+
+                throw new Error(
+                    'Предыдущая медицинская запись не найдена.'
+                );
+
+            }
+
+
+            log(
+                'Текущая:',
+                pair.current.id,
+                pair.current.date.toLocaleString(
+                    'ru-RU'
+                )
+            );
+
+
+            log(
+                'Предыдущая:',
+                pair.previous.id,
+                pair.previous.date.toLocaleString(
+                    'ru-RU'
+                )
+            );
+
+
+            const confirmed =
+                window.confirm(
+
+                    'Перенести текст предыдущей записи?\n\n' +
+
+                    'Предыдущая запись:\n' +
+
+                    pair.previous.date.toLocaleString(
+                        'ru-RU'
+                    ) +
+
+                    '\n\n' +
+
+                    pair.previous.text +
+
+                    '\n\n' +
+
+                    'Текущая запись ID: ' +
+
+                    currentId
+                );
+
+
+            if (!confirmed) {
+
+                log(
+                    'Отменено пользователем'
+                );
+
+                return;
+            }
+
+
+            const previousHtml =
+                await fetchPreviousRecordHtml(
+                    pair.previous.id
+                );
+
+
+            const previousText =
+                extractPreviousText(
+                    previousHtml
+                );
+
+
+            await insertIntoCurrentEditor(
+                currentId,
+                previousText
+            );
+
+
+           alert(
+    '✓ Текст предыдущей записи перенесён и сохранён.'
+);
+
+
+        } catch (error) {
+
+            console.error(
+                PREFIX,
+                error
+            );
+
+            alert(
+                'Не удалось перенести запись.\n\n' +
+                error.message
+            );
+        }
+    }
+
+
+    // =========================================================
+    // КНОПКА
+    // =========================================================
+
+    function createButton() {
+
+        if (
+            document.getElementById(
+                'damumed-transfer-previous-record'
+            )
+        ) {
+            return;
+        }
+
+
+        const button =
+            document.createElement(
+                'button'
+            );
+
+
+        button.id =
+            'damumed-transfer-previous-record';
+
+
+        button.type =
+            'button';
+
+
+        button.textContent =
+            'Перенести последнюю запись';
+
+
+        button.style.cssText = [
+
+            'position:fixed',
+            'right:20px',
+            'bottom:20px',
+            'z-index:2147483647',
+
+            'padding:10px 16px',
+
+            'border:1px solid #999',
+            'border-radius:4px',
+
+            'background:#f5f5f5',
+            'color:#333',
+
+            'font:14px Arial,sans-serif',
+
+            'cursor:pointer',
+
+            'box-shadow:0 2px 6px rgba(0,0,0,.2)'
+
+        ].join(';');
+
+
+        button.addEventListener(
+            'click',
+            function (event) {
+
+                event.preventDefault();
+
+                event.stopPropagation();
+
+                transferPreviousRecord();
+
+            }
+        );
+
+
+        document.body.appendChild(
+            button
+        );
+
+
+        log(
+            '✓ Кнопка создана'
+        );
+    }
+
+
+    // =========================================================
+    // ЗАПУСК
+    // =========================================================
+
+    function start() {
+
+        createButton();
+
+        log(
+            '✓ Версия 1.6 запущена'
+        );
+    }
+
+
+    if (
+        document.readyState ===
+        'loading'
+    ) {
+
+        document.addEventListener(
+            'DOMContentLoaded',
+            start
+        );
+
+    } else {
+
+        start();
+
+    }
+
+})();

@@ -1,0 +1,1073 @@
+// ==UserScript==
+// @name         DMED — Перенос предыдущего рецепта АЛО
+// @namespace    dmed-prescription-helper
+// @version      0.1
+// @description  Перенос параметров предыдущего рецепта в новый рецепт АЛО
+// @match        https://doc-ast.dmed.kz/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const STORAGE_KEY = 'dmed_previous_alo_recipe';
+
+    // ------------------------------------------------------------
+    // Утилиты
+    // ------------------------------------------------------------
+
+    function log(...args) {
+        console.log('[DMED RX]', ...args);
+    }
+
+    function getGridFromRow(row) {
+        return $(row).closest('.k-grid').data('kendoGrid');
+    }
+
+    function getRecipesFromCurrentPage() {
+        const rows = [...document.querySelectorAll('tr')];
+
+        const recipeRows = rows.filter(tr =>
+            tr.innerText.includes('Дата выписки рецепта') &&
+            tr.innerText.includes('Rp:')
+        );
+
+        const recipes = [];
+        const seen = new Set();
+
+        for (const recipeRow of recipeRows) {
+            const grid = getGridFromRow(recipeRow);
+
+            if (!grid) {
+                continue;
+            }
+
+            const item = grid.dataItem(recipeRow);
+
+            if (!item) {
+                continue;
+            }
+
+            const recipe = item.toJSON
+                ? item.toJSON()
+                : { ...item };
+
+            const key = String(
+                recipe.ID ||
+                recipe.PrescriptionNumber ||
+                `${recipe.RecipeDate || ''}|${recipe.Rp || ''}`
+            );
+
+            if (seen.has(key)) {
+                continue;
+            }
+
+            seen.add(key);
+            recipes.push(recipe);
+        }
+
+        return recipes;
+    }
+
+    function parseMnnFromRp(rp) {
+        if (!rp) return '';
+
+        // Например:
+        // Оланзапин, 10 мг, Таблетки...
+        return rp
+            .split(',')[0]
+            .trim();
+    }
+
+    function parseDose(recipe) {
+        return String(
+            recipe.Dosage ??
+            ''
+        ).trim();
+    }
+
+    function parseForm(recipe) {
+        return String(
+            recipe.DrugDosageForm ??
+            ''
+        ).trim()
+            .toLowerCase();
+    }
+
+    // ------------------------------------------------------------
+    // Работа с сохранёнными рецептами
+    // ------------------------------------------------------------
+
+    function getStoredRecipes() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+
+            if (!raw) {
+                return [];
+            }
+
+            const parsed = JSON.parse(raw);
+
+            // Совместимость со старой версией,
+            // где сохранялся только один объект
+            if (Array.isArray(parsed)) {
+                return parsed.map(recipe => {
+                    const tradeName = String(
+                        recipe.tradeName || ''
+                    ).trim().toLowerCase();
+
+                    if (tradeName === 'палиперидон') {
+                        recipe.mnn = 'Палиперидон';
+                    }
+
+                    if (
+                        tradeName === 'тизерцин' ||
+                        tradeName === 'тизерцин 25 мг'
+                    ) {
+                        recipe.mnn = 'Левомепромазин';
+                    }
+
+                    return recipe;
+                });
+            }
+
+            if (parsed && typeof parsed === 'object') {
+                const recipe = parsed;
+
+                const tradeName = String(
+                    recipe.tradeName || ''
+                ).trim().toLowerCase();
+
+                if (tradeName === 'палиперидон') {
+                    recipe.mnn = 'Палиперидон';
+                }
+
+                if (
+                    tradeName === 'тизерцин' ||
+                    tradeName === 'тизерцин 25 мг'
+                ) {
+                    recipe.mnn = 'Левомепромазин';
+                }
+
+                return [recipe];
+            }
+
+            return [];
+        } catch (e) {
+            console.error('[DMED RX] Ошибка чтения рецептов:', e);
+            return [];
+        }
+    }
+
+    function getStoredRecipe() {
+        const recipes = getStoredRecipes();
+
+        if (!recipes.length) {
+            return null;
+        }
+
+        return recipes[recipes.length - 1];
+    }
+
+    function saveRecipe(recipe) {
+        const recipes = getStoredRecipes();
+
+        const key = [
+            recipe.mnn || '',
+            recipe.dosage || '',
+            recipe.tradeName || ''
+        ]
+            .join('|')
+            .toLowerCase();
+
+        const existingIndex = recipes.findIndex(item => {
+            const itemKey = [
+                item.mnn || '',
+                item.dosage || '',
+                item.tradeName || ''
+            ]
+                .join('|')
+                .toLowerCase();
+
+            return itemKey === key;
+        });
+
+        if (existingIndex >= 0) {
+            recipes[existingIndex] = recipe;
+        } else {
+            recipes.push(recipe);
+        }
+
+        localStorage.setItem(
+            STORAGE_KEY,
+            JSON.stringify(recipes)
+        );
+    }
+
+    function chooseStoredRecipe() {
+        const recipes = getStoredRecipes();
+
+        if (!recipes.length) {
+            return null;
+        }
+
+        if (recipes.length === 1) {
+            return recipes[0];
+        }
+
+        const list = recipes.map((recipe, index) => {
+            return (
+                `${index + 1}. ` +
+                `${recipe.tradeName || recipe.mnn || 'Препарат'} ` +
+                `— ${recipe.dosageConcentration ?? recipe.dosage ?? 'доза не указана'} ` +
+                `— ${recipe.recipePackQty ?? '?'} уп.`
+            );
+        }).join('\n');
+
+        const answer = prompt(
+            'Выбери предыдущий рецепт:\n\n' +
+            list +
+            '\n\nВведи номер:'
+        );
+
+        if (answer === null) {
+            return null;
+        }
+
+        const index = Number(answer) - 1;
+
+        if (
+            !Number.isInteger(index) ||
+            index < 0 ||
+            index >= recipes.length
+        ) {
+            alert('Неверный номер рецепта.');
+            return null;
+        }
+
+        return recipes[index];
+    }
+
+    // ------------------------------------------------------------
+    // 1. Определение торгового названия
+    // ------------------------------------------------------------
+
+    function getTradeNameFallback(recipe) {
+        const mnn = String(
+            recipe.mnn ||
+            parseMnnFromRp(recipe.Rp) ||
+            ''
+        )
+            .trim()
+            .toLowerCase();
+
+        const dosage = String(
+            recipe.Dosage ??
+            ''
+        ).trim();
+
+        const form = parseForm(recipe);
+
+        const rp = String(
+            recipe.Rp ||
+            ''
+        ).trim().toLowerCase();
+
+        // Клозапин
+        if (mnn.includes('клозапин')) {
+            return 'Азалептол';
+        }
+
+        // Галоперидол деканоат
+        if (
+            mnn.includes('галоперидол') &&
+            (
+                rp.includes('деканоат') ||
+                form.includes('масля') ||
+                form.includes('инъек')
+            )
+        ) {
+            return 'Галоперидол Деканоат';
+        }
+
+        // Венлафаксин
+        if (mnn.includes('венлафаксин')) {
+            return 'Алвента';
+        }
+
+        // Амисульприд
+        if (mnn.includes('амисульприд')) {
+            return 'Амисульприд Санто';
+        }
+
+        // Хлорпромазин
+        if (mnn.includes('хлорпромазин')) {
+            return 'Аминазин';
+        }
+
+        // Амитриптилин
+        if (mnn.includes('амитриптилин')) {
+            return 'Амитриптилин-ТК';
+        }
+
+        // Обычный галоперидол
+        if (mnn.includes('галоперидол')) {
+            return 'Галоперидол';
+        }
+
+        // Ксеплион
+        if (
+            mnn.includes('палиперидон') &&
+            (
+                dosage === '100' ||
+                dosage === '150' ||
+                form.includes('инъек')
+            )
+        ) {
+            return 'Ксеплион';
+        }
+
+        // Олфрекс
+        if (mnn.includes('оланзапин')) {
+            return 'Олфрекс';
+        }
+
+        // Палиперидон в таблетках
+        if (mnn.includes('палиперидон')) {
+            return 'Палиперидон';
+        }
+
+        // Рисполепт Конста
+        if (
+            mnn.includes('рисперидон') &&
+            (
+                dosage === '25' ||
+                dosage === '37.5' ||
+                dosage === '37,5' ||
+                rp.includes('конста')
+            )
+        ) {
+            if (
+                dosage === '37.5' ||
+                dosage === '37,5' ||
+                rp.includes('37,5')
+            ) {
+                return 'Рисполепт Конста 37,5 мг';
+            }
+
+            return 'Рисполепт Конста 25 мг';
+        }
+
+        // Рисперидон
+        if (mnn.includes('рисперидон')) {
+            return 'Рисперидон';
+        }
+
+        // Тизерцин / левомепромазин
+        if (mnn.includes('левомепромазин')) {
+            return 'Тизерцин';
+        }
+
+        // Тревикта
+        if (
+            mnn.includes('палиперидон') &&
+            (
+                dosage === '350' ||
+                dosage === '525'
+            )
+        ) {
+            if (dosage === '525') {
+                return 'Тревикта 525 мг';
+            }
+
+            return 'Тревикта 350 мг';
+        }
+
+        // Трифтазин-Здоровье / трифлуоперазин
+        if (
+            mnn.includes('трифлуоперазин')
+        ) {
+            return 'Трифтазин-Здоровье';
+        }
+
+        // Циклодол / тригексифенидил
+        if (
+            mnn.includes('тригексифенидил') ||
+            mnn.includes('тригексифенидила')
+        ) {
+            return 'Циклодол';
+        }
+
+        return null;
+    }
+
+    function getTradeNameFromPage(recipe) {
+
+        // --------------------------------------------------------
+        // Сначала определяем торговое название по МНН.
+        // Это не позволяет взять чужой препарат с текущей страницы.
+        // --------------------------------------------------------
+
+        const fallback = getTradeNameFallback(recipe);
+
+        if (fallback) {
+            log(
+                'Торговое название определено по МНН:',
+                fallback
+            );
+
+            return fallback;
+        }
+
+        const html = document.documentElement.innerHTML;
+
+        // Ищем непосредственно в HTML страницы.
+        // DMED может использовать:
+        // обычный пробел
+        // &nbsp;
+        // &amp;nbsp;
+
+        const space = '(?:\\s|&nbsp;|&amp;nbsp;)*';
+
+        const match = html.match(
+            new RegExp(
+                'Таб\\.' +
+                space +
+                '([^<]+?)' +
+                space +
+                '\\d+(?:[.,]\\d+)?' +
+                space +
+                'мг' +
+                space +
+                '№' +
+                space +
+                '\\d+',
+                'i'
+            )
+        );
+
+        if (match) {
+            const tradeName = match[1]
+                .replace(/&nbsp;/gi, ' ')
+                .replace(/&amp;/gi, '&')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            log('Торговое название найдено:', tradeName);
+
+            return tradeName;
+        }
+
+        log('Торговое название по старому шаблону не найдено');
+
+        // --------------------------------------------------------
+        // ДОБАВЛЕНО:
+        // Для растворов, инъекций и других форм используем
+        // соответствие МНН → торговое название.
+        // Старую рабочую логику выше не трогаем.
+        // --------------------------------------------------------
+
+        const fallback2 = getTradeNameFallback(recipe);
+
+        if (fallback2) {
+            log(
+                'Торговое название определено по МНН:',
+                fallback2
+            );
+
+            return fallback2;
+        }
+
+        // Диагностика
+        const pos = html.toLowerCase().indexOf('таб.');
+
+        if (pos !== -1) {
+            log(
+                'Фрагмент HTML около Таб.:',
+                html.substring(pos, pos + 500)
+            );
+        }
+
+        return null;
+    }
+
+    function rememberPreviousRecipe() {
+        const recipes = getRecipesFromCurrentPage();
+
+        console.log('[DMED RX] RAW RECIPES:', recipes);
+
+        if (!recipes.length) {
+            alert(
+                'Не найден рецепт на текущей странице.\n\n' +
+                'Открой предыдущую запись → Рецепты АЛО → убедись, ' +
+                'что рецепты отображаются.'
+            );
+
+            return;
+        }
+
+        const saved = [];
+
+        for (const recipe of recipes) {
+            const mnn = parseMnnFromRp(recipe.Rp);
+
+            const simplified = {
+                ID: recipe.ID,
+
+                // МНН — для информации
+                mnn: mnn,
+
+                // Торговое название — именно его будем вводить в поиск DMED
+                tradeName: getTradeNameFromPage({
+                    ...recipe,
+                    mnn: mnn
+                }),
+
+                dosage: recipe.Dosage,
+                dosageConcentration: recipe.DosageConcentration,
+
+                dosageForm: recipe.DrugDosageForm,
+
+                recipePackQty: recipe.RecipePackQty,
+
+                dtd: recipe.Dtd,
+                ds: recipe.Ds,
+
+                useMethodName: recipe.UseMethodName,
+
+                rp: recipe.Rp,
+
+                prescriptionNumber: recipe.PrescriptionNumber,
+
+                recipeDate: recipe.RecipeDate
+            };
+
+            saveRecipe(simplified);
+            saved.push(simplified);
+
+            log('Сохранён предыдущий рецепт:', simplified);
+        }
+
+        const list = saved.map(recipe =>
+            `${recipe.tradeName || recipe.rp || recipe.mnn} — ` +
+            `${recipe.dosageConcentration ?? recipe.dosage ?? 'доза не указана'} — ` +
+            `${recipe.recipePackQty ?? '?'} уп.`
+        ).join('\n');
+
+        alert(
+            'Предыдущие рецепты сохранены.\n\n' +
+            list
+        );
+    }
+
+    // ------------------------------------------------------------
+    // 2. Поиск препарата среди остатков
+    // ------------------------------------------------------------
+
+    function findAvailableDrugRow(recipe) {
+        const mnn = String(recipe.mnn || '').trim().toLowerCase();
+
+        // Для поиска используем реальную дозировку препарата.
+        // В некоторых рецептах recipe.Dosage содержит количество
+        // таблеток в упаковке (например, 25), а не дозировку препарата.
+        const dosage = String(
+    (
+        String(recipe.rp || recipe.Rp || '').match(
+            /,\s*([\d.,]+)\s*мг/i
+        )?.[1] ||
+        recipe.dosageConcentration ||
+        recipe.dosage ||
+        ''
+    )
+).trim();
+
+        const rows = [...document.querySelectorAll('tr')];
+
+        const candidates = rows.filter(row => {
+            const grid = getGridFromRow(row);
+
+            if (!grid) return false;
+
+            const item = grid.dataItem(row);
+
+            if (!item) return false;
+
+            const data = item.toJSON
+                ? item.toJSON()
+                : item;
+
+            const itemMnn = String(
+                data.DrugMNNName || ''
+            ).trim().toLowerCase();
+
+            const itemDosage = String(
+                data.Dosage ?? ''
+            ).trim();
+
+            const packages = Number(
+                data.StockInPackages || 0
+            );
+
+            const units = Number(
+                data.StockInUnits || 0
+            );
+
+            return (
+                itemMnn === mnn &&
+                itemDosage === dosage &&
+                (packages > 0 || units > 0)
+            );
+        });
+
+        if (!candidates.length) {
+            return null;
+        }
+
+        return candidates[0];
+    }
+
+    // ------------------------------------------------------------
+    // 3. Выбор способа введения
+    // ------------------------------------------------------------
+
+    function setUseMethod(name) {
+        if (!name) {
+            log('Способ введения не указан');
+            return false;
+        }
+
+        const combo = $('#cmbFreeUseMethods')
+            .data('kendoComboBox');
+
+        if (!combo) {
+            log('ComboBox способа введения не найден');
+            return false;
+        }
+
+        const methods = combo.dataSource
+            .data()
+            .map(x => x.toJSON ? x.toJSON() : x);
+
+        const wanted = name.trim().toLowerCase();
+
+        // Сначала ищем актуальный вариант:
+        // EndDate == null
+        let matchIndex = methods.findIndex(x =>
+            String(x.Name || '').trim().toLowerCase() === wanted &&
+            !x.EndDate
+        );
+
+        // Если не нашли — любой совпадающий
+        if (matchIndex < 0) {
+            matchIndex = methods.findIndex(x =>
+                String(x.Name || '').trim().toLowerCase() === wanted
+            );
+        }
+
+        if (matchIndex < 0) {
+            log('Не найден способ введения:', name);
+            return false;
+        }
+
+        const match = methods[matchIndex];
+
+        // Сначала выбираем именно строку ComboBox,
+        // затем синхронизируем его значение и событие change.
+        combo.select(matchIndex);
+        combo.value(String(match.ID));
+        combo.trigger('change');
+
+        log(
+            'Способ введения установлен:',
+            match.ID,
+            match.Name
+        );
+
+        return true;
+    }
+
+    // ------------------------------------------------------------
+    // 4. Установка количества упаковок
+    // ------------------------------------------------------------
+
+    function setPackages(value) {
+        const input = document.querySelector(
+            '#ntbNumberOfPackages'
+        );
+
+        if (!input) {
+            log('Поле количества упаковок не найдено');
+            return false;
+        }
+
+        const numeric = $(input).data('kendoNumericTextBox');
+
+        if (numeric) {
+            numeric.value(Number(value));
+            numeric.trigger('change');
+
+            // Дополнительно синхронизируем обычное input-поле,
+            // чтобы DMED не потерял значение при перерисовке формы.
+            input.value = value;
+            $(input).trigger('input');
+            $(input).trigger('change');
+        } else {
+            input.value = value;
+            $(input).trigger('change');
+            $(input).trigger('input');
+        }
+
+        log(
+            'Количество упаковок установлено:',
+            value
+        );
+
+        return true;
+    }
+
+    // ------------------------------------------------------------
+    // 5. Перенос рецепта
+    // ------------------------------------------------------------
+
+    async function applyPreviousRecipe() {
+        const recipe = chooseStoredRecipe();
+
+        if (!recipe) {
+            if (!getStoredRecipes().length) {
+                alert(
+                    'Нет сохранённого предыдущего рецепта.\n\n' +
+                    'Сначала открой предыдущую запись и нажми ' +
+                    '«Запомнить предыдущий рецепт».'
+                );
+            }
+
+            return;
+        }
+
+        log('Применяем рецепт:', recipe);
+
+        // Проверяем, что форма рецепта открыта
+        const drugSearch = document.querySelector(
+            '#tbSearchFreeMedication'
+        );
+
+        if (!drugSearch) {
+            alert(
+                'Форма рецепта АЛО не найдена.\n\n' +
+                'Сначала открой Рецепты АЛО → нажми +.'
+            );
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Выбираем категорию «Все категории, состоящие
+        // на динамическом наблюдении»
+        // --------------------------------------------------------
+
+        const categoryCombo =
+            $('#cmbPrescriptionCategory').data('kendoComboBox');
+
+        if (categoryCombo) {
+            categoryCombo.value('13');
+            categoryCombo.trigger('change');
+
+            log(
+                'Категория установлена:',
+                categoryCombo.value(),
+                categoryCombo.text()
+            );
+        }
+
+        // Ждём обновления таблицы остатков
+        await new Promise(resolve =>
+            setTimeout(resolve, 500)
+        );
+
+        // --------------------------------------------------------
+        // Ищем препарат через штатный поиск DMED
+        // --------------------------------------------------------
+
+        const searchInput = document.querySelector(
+            '#tbSearchFreeMedication'
+        );
+
+        if (!searchInput) {
+            alert('Поле поиска препарата не найдено.');
+            return;
+        }
+
+        const searchText = String(
+            recipe.tradeName || ''
+        ).trim();
+
+        if (!searchText) {
+            alert(
+                'Не удалось определить торговое наименование препарата.\n\n' +
+                'Открой предыдущую запись и убедись, что в тексте рецепта указано торговое название.'
+            );
+
+            return;
+        }
+
+        log('Ищем препарат через DMED:', searchText);
+
+        // --------------------------------------------------------
+        // Заполняем только поле поиска.
+        // Кнопку поиска DMED НЕ нажимаем.
+        // Ты нажимаешь её сам.
+        // --------------------------------------------------------
+
+        const searchWidget =
+            $(searchInput).data('kendoAutoComplete') ||
+            $(searchInput).data('kendoComboBox') ||
+            $(searchInput).data('kendoDropDownList');
+
+        if (searchWidget) {
+            searchWidget.value(searchText);
+
+            log(
+                'Значение поиска установлено через Kendo:',
+                searchText
+            );
+        } else {
+            searchInput.value = searchText;
+
+            log(
+                'Kendo-контрол не найден, значение вставлено напрямую:',
+                searchText
+            );
+        }
+
+        // --------------------------------------------------------
+        // Ждём, пока ты вручную нажмёшь кнопку поиска
+        // --------------------------------------------------------
+
+        log('Ждём ручного запуска поиска в DMED...');
+
+        let row = null;
+
+        for (let i = 0; i < 10; i++) {
+            row = findAvailableDrugRow(recipe);
+
+            if (row) {
+                log('Препарат найден после ручного поиска');
+                break;
+            }
+
+            await new Promise(resolve =>
+                setTimeout(resolve, 500)
+            );
+        }
+
+        if (!row) {
+            alert(
+                'Препарат не найден после поиска DMED.\n\n' +
+                'Торговое наименование: ' +
+                (recipe.tradeName || 'не определено') + '\n' +
+                'МНН: ' +
+                (recipe.mnn || 'не определено') + '\n' +
+             'Дозировка: ' +
+(
+    recipe.dosageConcentration ||
+    (
+        String(recipe.rp || recipe.Rp || '').match(
+            /,\s*([\d.,]+)\s*мг/i
+        )?.[1] || ''
+    ) ||
+    recipe.dosage ||
+    'не определена'
+) + '\n\n' +
+                'Убедись, что после вставки названия ты нажал кнопку поиска.'
+            );
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Обрабатываем найденную строку препарата
+        // --------------------------------------------------------
+
+        const grid = getGridFromRow(row);
+        const item = grid.dataItem(row);
+
+        const drug = item.toJSON
+            ? item.toJSON()
+            : item;
+
+        log('Найден препарат:', drug);
+
+        const stockPackages =
+            Number(drug.StockInPackages || 0);
+
+        const stockUnits =
+            Number(drug.StockInUnits || 0);
+
+        log(
+            'Остаток:',
+            stockPackages,
+            'упаковок;',
+            stockUnits,
+            'единиц'
+        );
+
+        // --------------------------------------------------------
+        // Кликаем по найденному препарату
+        // --------------------------------------------------------
+
+        row.click();
+
+        $(row).trigger('click');
+
+        // --------------------------------------------------------
+        // ДОБАВЛЕНО:
+        // DMED после клика может ещё заполнять форму.
+        // Поэтому даём ему время и затем несколько раз
+        // устанавливаем сохранённые параметры.
+        // --------------------------------------------------------
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 1000)
+        );
+
+        let methodSet = false;
+        let packagesSet = false;
+
+        for (let i = 0; i < 10; i++) {
+
+            // ----------------------------------------------------
+            // Способ введения
+            // ----------------------------------------------------
+
+            if (recipe.useMethodName) {
+                methodSet = setUseMethod(
+                    recipe.useMethodName
+                );
+            } else {
+                methodSet = true;
+            }
+
+            // Даём DMED время обработать change способа введения
+            // до установки количества упаковок.
+            await new Promise(resolve =>
+                setTimeout(resolve, 150)
+            );
+
+            // ----------------------------------------------------
+            // Количество упаковок
+            // ----------------------------------------------------
+
+            if (recipe.recipePackQty != null) {
+                packagesSet = setPackages(
+                    recipe.recipePackQty
+                );
+            } else {
+                packagesSet = true;
+            }
+
+            if (methodSet && packagesSet) {
+                log(
+                    'Способ введения и количество успешно установлены'
+                );
+            }
+
+            await new Promise(resolve =>
+                setTimeout(resolve, 300)
+            );
+        }
+
+        log('Заполнение завершено');
+
+        alert(
+            'Параметры предыдущего рецепта перенесены.\n\n' +
+            'Проверь форму перед сохранением.'
+        );
+    }
+
+    // ------------------------------------------------------------
+    // 6. UI
+    // ------------------------------------------------------------
+
+    function createButton(text, title, handler) {
+        const button = document.createElement('button');
+
+        button.type = 'button';
+        button.textContent = text;
+
+        button.title = title;
+
+        button.style.position = 'fixed';
+        button.style.right = '20px';
+        button.style.zIndex = '2147483647';
+
+        button.style.padding = '8px 12px';
+        button.style.border = '1px solid #aaa';
+        button.style.borderRadius = '5px';
+
+        button.style.background = '#fff';
+        button.style.cursor = 'pointer';
+
+        button.addEventListener('click', handler);
+
+        return button;
+    }
+
+    function addButtons() {
+        if (document.querySelector('#dmed-rx-save-btn')) {
+            return;
+        }
+
+        const saveBtn = createButton(
+            '💾 Запомнить рецепт',
+            'Запомнить рецепт из текущей записи',
+            rememberPreviousRecipe
+        );
+
+        saveBtn.id = 'dmed-rx-save-btn';
+        saveBtn.style.bottom = '105px';
+
+        const applyBtn = createButton(
+            '↻ Предыдущий рецепт',
+            'Заполнить новый рецепт данными предыдущего',
+            applyPreviousRecipe
+        );
+
+        applyBtn.id = 'dmed-rx-apply-btn';
+        applyBtn.style.bottom = '65px';
+
+        document.body.appendChild(saveBtn);
+        document.body.appendChild(applyBtn);
+    }
+
+    // ------------------------------------------------------------
+    // Старт
+    // ------------------------------------------------------------
+
+    function init() {
+        addButtons();
+
+        log(
+            'Готов.',
+            'Сохранённые рецепты:',
+            getStoredRecipes()
+        );
+
+        // DMED постоянно перерисовывает интерфейс.
+        // Если наши кнопки исчезли — возвращаем их.
+        setInterval(() => {
+            addButtons();
+        }, 1000);
+    }
+
+    if (
+        document.readyState === 'loading'
+    ) {
+        document.addEventListener(
+            'DOMContentLoaded',
+            init
+        );
+    } else {
+        init();
+    }
+
+})();

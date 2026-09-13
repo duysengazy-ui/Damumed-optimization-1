@@ -1,0 +1,221 @@
+// ==UserScript==
+// @name         Damumed — анализы SANGUIS
+// @namespace    local.damumed.labs
+// @version      1.0.0
+// @description  Три пользовательских набора анализов через штатные формы Damumed.
+// @match        https://doc-ast.dmed.kz/MedicalRecords*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(() => {
+  'use strict';
+  if (window.top !== window.self || document.getElementById('local-labs-helper')) return;
+  const packs = [
+    {name:'OAK ОАМ SMLAB', codes:['B02.061.001','B01.077.002','B02.110.002']},
+    {name:'Биохимия 2025', codes:['B03.397.002','B03.155.002','B03.293.002','B03.335.002','B03.398.002','B03.363.002']},
+    {name:'Микрореакция 2025', codes:['B06.681.012']}
+  ];
+  const receiverName = 'ТОО "Sanguis (Сангвис)"';
+  const financeName = 'Услуги, оплачиваемые в рамках комплексного тарифа';
+  const norm = v => String(v ?? '').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+  const read = (x,k) => typeof x?.get === 'function' ? x.get(k) : x?.[k];
+  const visible = e => !!e?.isConnected && !!e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden';
+  const fail = text => { throw new Error(text); };
+  // Шаблоны и кнопка сохранения — соседи formReferral в том же .modal.
+  const one = (scope,selector) => { const a=(scope===run?.form?run.scope:scope).querySelectorAll(selector); if(a.length!==1) fail('Элемент '+selector+' не найден однозначно. Продолжите вручную.'); return a[0]; };
+  const enabled = e => !e.disabled && e.getAttribute('aria-disabled') !== 'true' && !e.classList.contains('k-state-disabled');
+  const sameSet = (a,b) => a.length===b.length && [...a].sort().every((v,i)=>v===[...b].sort()[i]);
+  let run=null, busy=false, panel=null, status=null;
+  const completed=new Set(), uncertain=new Set();
+  const host=document.createElement('div'); host.id='local-labs-helper';
+  const style=document.createElement('style');
+  style.textContent='#local-labs-helper{position:fixed;top:40px;right:18px;z-index:2147483646;font:14px Arial;color:#172333}#local-labs-helper button{padding:6px 10px;font:14px Arial;cursor:pointer}#local-labs-helper button:disabled{cursor:default}#local-labs-helper .labs-panel{position:fixed;right:18px;top:80px;width:min(470px,calc(100vw - 56px));max-height:calc(100vh - 130px);overflow:auto;background:white;border:2px solid #456;border-radius:7px;padding:16px;box-shadow:0 8px 24px #0004}#local-labs-helper label{display:block;margin:12px 0}#local-labs-helper p{white-space:pre-wrap;line-height:1.45}#local-labs-helper button{margin:3px}';
+  host.append(style); document.documentElement.append(host);
+  const button=(text,fn,parent=host)=>{const b=document.createElement('button');b.type='button';b.textContent=text;b.onclick=fn;parent.append(b);return b;};
+  const launcher=button('Анализы',openPanel);
+  // Слева от имеющихся помощников; освобождаем место в строке вкладок.
+  function dock(){
+    const neighbours=['local-hospitalization-helper','local-three-referrals','local-vkk-helper'].map(id=>document.getElementById(id)).filter(visible);
+    const left=neighbours.length?Math.min(...neighbours.map(e=>e.getBoundingClientRect().left)):innerWidth-18;
+    host.style.top='3px';host.style.right=Math.max(18,innerWidth-left+8)+'px';
+    const tabs=document.getElementById('MedRecEditorTabLinks');
+    if(tabs)tabs.style.setProperty('max-width','calc(100% - '+Math.ceil(innerWidth-host.getBoundingClientRect().left+12)+'px)','important');
+  }
+  let dockPending=false;
+  const scheduleDock=()=>{if(dockPending)return;dockPending=true;requestAnimationFrame(()=>{dockPending=false;dock();});};
+  new MutationObserver(scheduleDock).observe(document.body,{childList:true,subtree:true});
+  window.addEventListener('resize',scheduleDock);dock();
+  function context(){
+    const fs=[...document.querySelectorAll('iframe[id^="iframeMedRec_"]')].filter(visible);
+    if(fs.length!==1) fail('Откройте одну медзапись.');
+    const frame=fs[0], id=frame.id.slice('iframeMedRec_'.length), body=frame.contentDocument?.querySelector('body[id^="editor_"]');
+    if(!/^\d+$/.test(id)||!body) fail('Редактор медзаписи недоступен.');
+    const links=[...document.querySelectorAll('#Assignments a[href*="/MedicalRecords/MedicalRecordDestinations?"]')].filter(visible);
+    if(links.length!==1||new URL(links[0].href).searchParams.get('MedRecordID')!==id) fail('Раздел назначений не соответствует медзаписи.');
+    return {frame,body,id,text:body.innerText,url:location.href,link:links[0]};
+  }
+  function guard(form){
+    if(!run||run.cancelled) fail('Выполнение остановлено.');
+    const c=context(), old=run.context;
+    if(c.id!==old.id||c.body!==old.body||c.frame!==old.frame||c.text!==old.text||c.url!==old.url) fail('Медзапись изменилась. Автоматизация остановлена.');
+    if(form && (!visible(form)||form!==run.form||window.CreateLaboratoryAssignment!==run.api||String(run.api.model.ParentMedicalRecordID)!==old.id)) fail('Форма анализов изменилась. Продолжите вручную.');
+  }
+  function report(text){if(status) status.textContent=text;}
+  async function wait(check,label,timeout=15000){
+    const end=Date.now()+timeout;
+    do {guard();const value=check();if(value)return value;await new Promise(r=>setTimeout(r,100));}while(Date.now()<end);
+    fail(label+': результат не подтверждён. Продолжите вручную.');
+  }
+  function widget(form,id){
+    guard(form); const e=one(form,'#'+id), w=window.jQuery?.(e).data('kendoComboBox');
+    if(!w?.dataSource||!w.options?.dataValueField||!w.options?.dataTextField) fail('Недоступен список «'+id+'».');
+    return w;
+  }
+  function item(w){const i=w.select(), d=i>=0?w.dataItem(i):null;return d&&String(read(d,w.options.dataValueField))===String(w.value())&&String(w.value())!==''?d:null;}
+  async function choose(form,id,predicate,{replace=false,query=null}={}){
+    const w=widget(form,id), old=item(w), before=String(w.value()??'');
+    if(old&&predicate(old,w))return old;
+    if(!replace && (old||before||norm(w.text())))fail('В поле «'+id+'» уже другое значение. Оно сохранено.');
+    if(!enabled(w.element[0])||w.element[0].readOnly)fail('Поле «'+id+'» недоступно.');
+    if(query){w.input.val(query);w.search(query);}
+    else w.open();
+    await wait(()=>{guard(form);return Array.from(w.dataSource.view()).length;},'Список '+id);
+    const data=Array.from(w.dataSource.view()), found=data.map((d,i)=>({d,i})).filter(x=>predicate(x.d,w));
+    if(found.length!==1)fail('В списке «'+id+'» нет одного точного совпадения. Выберите вручную.');
+    guard(form);
+    if(String(w.value()??'')!==before)fail('Поле «'+id+'» изменилось во время загрузки. Проверьте вручную.');
+    const desired=String(read(found[0].d,w.options.dataValueField));
+    w.select(found[0].i);w.trigger('change');w.close();
+    await wait(()=>{guard(form);const d=item(w);return d&&String(w.value())===desired&&predicate(d,w);},'Выбор '+id);
+    return item(w);
+  }
+  const textIs=value=>(d,w)=>norm(read(d,w.options.dataTextField))===value;
+  function grid(form,id){guard(form);const w=window.jQuery(one(form,'#'+id)).data('kendoGrid');if(!w?.dataSource)fail('Таблица '+id+' недоступна.');return Array.from(w.dataSource.data());}
+  const serviceCode=d=>norm(read(d,'PublicCode'))||norm(read(d,'Name')).match(/^B\d{2}\.\d{3}\.\d{3}/)?.[0]||'';
+  async function click(form,selector){await wait(()=>{guard(form);const b=one(form,selector);return visible(b)&&enabled(b)?b:null;},'Кнопка '+selector);guard(form);one(form,selector).click();}
+  async function openForm(){
+    guard();
+    if([...document.querySelectorAll('#formReferral')].some(visible))fail('Форма назначения уже открыта. Завершите её перед запуском анализов.');
+    const selector='#btnCreateLabortoryAssignment_'+run.context.id;
+    if(!document.querySelector(selector)){run.context.link.click();await wait(()=>document.querySelector(selector),'Загрузка назначений');}
+    const menu=one(document,selector);guard();
+    if(!visible(menu)){const group=menu.closest('.btn-group');if(!group)fail('Меню назначений не найдено.');one(group,'button.dropdown-toggle').click();}
+    await wait(()=>visible(menu)&&enabled(menu),'Меню лабораторных исследований');guard();menu.click();
+    const form=await wait(()=>{const fs=[...document.querySelectorAll('#formReferral')].filter(visible);return fs.length===1&&fs[0].querySelector('#grdAssignments')?fs[0]:null;},'Открытие лабораторного направления');
+    run.form=form;run.scope=form.closest('.modal');run.api=window.CreateLaboratoryAssignment;
+    guard(form);
+    if(run.api.controls.formReferral.self[0]!==form)fail('Штатный API относится к другой форме.');
+    host.parentNode!==form.closest('.modal')&&form.closest('.modal')?.append(host);
+    if(grid(form,'grdAssignments').length)fail('В форме уже есть услуги. Они не изменены.');
+    return form;
+  }
+  function verifyServices(form,pack,receiverID){
+    const rows=grid(form,'grdAssignments');
+    if(!sameSet(rows.map(serviceCode),pack.codes)||rows.some(d=>String(read(d,'ReceiverMoID'))!==receiverID))fail('Состав услуг или получатель изменились. Автоматическое сохранение остановлено.');
+    return rows;
+  }
+  async function prepare(pack){
+    report(pack.name+': открываю форму…');const form=await openForm();
+    await choose(form,'rbPaymentTypeFilter',textIs('Иные'),{replace:true});
+    await click(form,'button[onclick="window.CreateLaboratoryAssignment.controls.wndAddLabService.open(event)"]');
+    await wait(()=>visible(one(form,'#wndAddLabService')),'Окно шаблонов');
+    const receiver=await choose(form,'cmbTemplateReceiver',textIs(receiverName),{replace:true});
+    const receiverID=String(read(receiver,widget(form,'cmbTemplateReceiver').options.dataValueField));
+    await choose(form,'cmbTemplateType',textIs('Пользовательские'),{replace:true});
+    await choose(form,'cmbTemplate',textIs(pack.name));
+    await wait(()=>grid(form,'grdTemplateServices').length,'Загрузка состава шаблона');
+    const template=grid(form,'grdTemplateServices');
+    if(!sameSet(template.map(serviceCode),pack.codes))fail('Состав шаблона «'+pack.name+'» отличается от проверенного. Проверьте услуги вручную.');
+    const checks=[...one(form,'#grdTemplateServices').querySelectorAll('input[name="chbTemplateService"]')];
+    if(checks.length!==pack.codes.length||checks.some(e=>!e.checked))fail('Не все услуги шаблона отмечены. Проверьте вручную.');
+    await click(form,'#btnAddTemplateAssignment');
+    await wait(()=>grid(form,'grdAssignments').length===pack.codes.length&&!visible(one(form,'#wndAddLabService')),'Добавление всех услуг');
+    verifyServices(form,pack,receiverID);
+    report(pack.name+': услуги добавлены, выбираю диагноз и финансирование…');
+    // Единственный существующий диагноз этой записи; никакого фиксированного F-кода.
+    const sick=widget(form,'cmbSick');
+    if(!item(sick))await choose(form,'cmbSick',()=>true);
+    const sickValue=String(sick.value());
+    await click(form,'#btnIdentifyFinanceSource');
+    await wait(()=>{guard(form);return grid(form,'grdAssignments').every(d=>read(d,'FinanceSourceIdentifyGuid'))&&widget(form,'cmbFinanceSource').dataSource.view().length;},'Определение финансирования',20000);
+    await choose(form,'cmbFinanceSource',textIs(financeName),{replace:true});
+    const financeValue=String(widget(form,'cmbFinanceSource').value());
+    await wait(()=>verifyServices(form,pack,receiverID).every(d=>String(read(d,'TypSrcFinID'))===financeValue),'Финансирование каждой услуги');
+    // Damumed показывает это поле только для диагноза с ограничением доступа.
+    await wait(()=>window.jQuery.active===0,'Завершение загрузки полей');
+    if(visible(widget(form,'cmbDisplaySick').input[0])){
+      await choose(form,'cmbDisplaySick',d=>norm(read(d,'Mkb10Code'))==='Z00.0'&&norm(read(d,'DisplayName'))==='Общий медицинский осмотр',{query:'Общий медицинский осмотр'});
+    }
+    return {form,pack,receiverID,sickValue,financeValue};
+  }
+  function preflight(state){
+    const {form,pack,receiverID,sickValue,financeValue}=state;guard(form);
+    const rows=verifyServices(form,pack,receiverID);
+    if(!textIs('Иные')(item(widget(form,'rbPaymentTypeFilter')),widget(form,'rbPaymentTypeFilter')))fail('Тип оплаты изменён.');
+    if(!item(widget(form,'cmbSick'))||String(widget(form,'cmbSick').value())!==sickValue)fail('Диагноз изменён.');
+    if(!textIs(financeName)(item(widget(form,'cmbFinanceSource')),widget(form,'cmbFinanceSource'))||rows.some(d=>String(read(d,'TypSrcFinID'))!==financeValue||!read(d,'FinanceSourceIdentifyGuid')||(!read(d,'MaterialTypeID')&&!read(d,'SubMaterialTypeID'))))fail('Не подтверждены финансирование или материал всех услуг.');
+    const display=widget(form,'cmbDisplaySick');
+    if(visible(display.input[0])&&norm(read(item(display),'Mkb10Code'))!=='Z00.0')fail('Диагноз для отображения не подтверждён.');
+    if(!run.api.controls.formReferral.isValid())fail('Проверка Damumed не пройдена. Исправьте отмеченные поля вручную.');
+    return rows;
+  }
+  async function save(state,key){
+    const rows=preflight(state), ids=rows.map(d=>String(read(d,'ID'))), jq=window.jQuery;
+    let answer=null;const api=run.api;
+    const observed=(event,xhr,settings,result)=>{
+      if(window.CreateLaboratoryAssignment!==api)return;
+      if(new URL(settings.url,location.href).pathname!=='/MedicalRecords/SaveAssignmentsByDialog')return;
+      try {
+        const plans=[];
+        const visit=x=>{if(!x||typeof x!=='object')return;if(x.MedRecordPlanService)plans.push(x.MedRecordPlanService);Object.values(x).forEach(visit);};
+        visit(JSON.parse(settings.data));
+        if(!sameSet(plans.map(p=>String(p.PricelistServicesMOId)),ids)||plans.some(p=>String(p.ParentMedRecId)!==run.context.id))return;
+        answer=result;
+      }catch{/* Неподтверждённый ответ не считается сохранением. */}
+    };
+    jq(document).on('ajaxSuccess.localLabs',observed);
+    try{
+      await wait(()=>enabled(one(state.form,'#btnSaveAssignment')),'Готовность сохранения');
+      preflight(state);uncertain.add(key);
+      report(state.pack.name+': сохраняю. Если Damumed задаст вопрос, проверьте его самостоятельно.');
+      one(state.form,'#btnSaveAssignment').click();
+      await wait(()=>answer,'Ответ Damumed о сохранении',25000);
+      if(answer.Status!==1||!answer.Object||answer.Object.SystemError)fail('Damumed не подтвердил полное сохранение набора. Проверьте направление вручную; повтор автоматически не выполняется.');
+      await wait(()=>!visible(state.form),'Закрытие сохранённой формы');
+      completed.add(key);uncertain.delete(key);
+    }finally{jq(document).off('ajaxSuccess.localLabs',observed);document.documentElement.append(host);}
+  }
+  async function execute(selected,confirm,start){
+    if(busy||!confirm.checked)return;
+    busy=true;start.disabled=true;launcher.disabled=true;
+    const saved=[];
+    try{
+      run={context:context(),cancelled:false};
+      for(const pack of selected){
+        guard();const key=run.context.id+'|'+pack.name;
+        if(completed.has(key))fail(pack.name+': уже сохранён этим скриптом в текущей вкладке. Повтор остановлен.');
+        if(uncertain.has(key))fail(pack.name+': ранее была попытка сохранения с неподтверждённым результатом. Проверьте назначения вручную.');
+        const state=await prepare(pack);await save(state,key);saved.push(pack.name);
+      }
+      report('Сохранены наборы:\n'+saved.join('\n'));
+    }catch(error){report(error.message+'\n'+(saved.length?'Уже сохранены:\n'+saved.join('\n'):'Ни одного сохранения скриптом не подтверждено.')+'\nТекущую форму проверьте вручную. Следующие наборы не запускались.');}
+    finally{busy=false;confirm.checked=false;start.disabled=true;launcher.disabled=false;}
+  }
+  function openPanel(){
+    if(panel){if(!busy){panel.remove();panel=null;document.documentElement.append(host);}return;}
+    panel=document.createElement('section');panel.className='labs-panel';host.append(panel);
+    const title=document.createElement('b');title.textContent='Анализы — SANGUIS';panel.append(title);
+    const options=packs.map(pack=>{const label=document.createElement('label'),c=document.createElement('input');c.type='checkbox';c.checked=true;label.append(c,' '+pack.name+' ('+pack.codes.length+' услуг)');panel.append(label);return {c,pack};});
+    const info=document.createElement('p');info.textContent='Иные → ТОО Sanguis → пользовательские шаблоны. Диагноз из медзаписи; финансирование — комплексный тариф; Z00.0 для отображения, когда поле доступно. Каждый набор сохраняется отдельно.';panel.append(info);
+    const label=document.createElement('label'),confirm=document.createElement('input');confirm.type='checkbox';label.append(confirm,' Пациент и выбранные анализы проверены, разрешаю их создание и сохранение');panel.append(label);
+    status=document.createElement('p');status.setAttribute('role','status');panel.append(status);
+    const start=button('Создать выбранные анализы',()=>{options.forEach(x=>x.c.disabled=true);execute(options.filter(x=>x.c.checked).map(x=>x.pack),confirm,start).finally(()=>options.forEach(x=>x.c.disabled=false));},panel);start.disabled=true;
+    confirm.onchange=()=>start.disabled=busy||!confirm.checked||!options.some(x=>x.c.checked);
+    options.forEach(x=>x.c.onchange=()=>{confirm.checked=false;start.disabled=true;});
+    button('Остановить',()=>{if(run)run.cancelled=true;report('Остановка запрошена. Уже отправленный запрос сохранения отменить нельзя; проверьте назначения.');},panel);
+    button('Закрыть',()=>{if(busy){report('Сначала дождитесь завершения или нажмите «Остановить».');return;}panel.remove();panel=null;document.documentElement.append(host);},panel);
+  }
+  window.addEventListener('pagehide',()=>{if(run)run.cancelled=true;});
+})();

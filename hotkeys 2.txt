@@ -1,0 +1,885 @@
+// ==UserScript==
+// @name         DMED — Cleaner + Hotkeys
+// @namespace    dmed-cleaner-hotkeys
+// @version      0.1
+// @description  Убирает лишние popup и добавляет горячие клавиши DMED
+// @match        https://doc-ast.dmed.kz/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const PREFIX = '[DMED HELPER]';
+
+    // ============================================================
+    // НАСТРОЙКИ
+    // ============================================================
+
+    const SETTINGS = {
+
+        // Автоматически подтверждать:
+        // «У пациента не было приема в последние 60 дней...
+        //  Вы хотите его за этот ... зарегистрировать?»
+        autoConfirm60Days: true,
+
+        // Автоматически подтверждать:
+        // «Вы записываете пациента на уже прошедшее время...
+        //  Вы уверены, что хотите продолжить запись?»
+        autoConfirmPastTime: true,
+
+        // Автоматически подтверждать проверку данных пациента
+        autoConfirmPatientDataCheck: true,
+
+        // Убирать popup с предложением добавить текст
+        // как рекомендацию по лечению
+        hideRecommendationPopup: true,
+
+        // Горячие клавиши
+        saveHotkey: true,
+        printHotkey: true
+    };
+
+
+    // ============================================================
+    // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+    // ============================================================
+
+    function log(...args) {
+        console.log(PREFIX, ...args);
+    }
+
+
+    function normalizeText(text) {
+        return String(text || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+
+    function isVisible(element) {
+        if (!element) return false;
+
+        const style = window.getComputedStyle(element);
+
+        if (
+            style.display === 'none' ||
+            style.visibility === 'hidden' ||
+            style.opacity === '0'
+        ) {
+            return false;
+        }
+
+        const rect = element.getBoundingClientRect();
+
+        return (
+            rect.width > 0 ||
+            rect.height > 0 ||
+            style.position === 'fixed'
+        );
+    }
+
+
+    // ============================================================
+    // ПОИСК ШТАТНОЙ КНОПКИ ПО ТЕКСТУ
+    // ============================================================
+
+    function findButtonExact(text) {
+        const wanted = normalizeText(text);
+
+        const elements = [
+            ...document.querySelectorAll('button'),
+            ...document.querySelectorAll('input[type="button"]'),
+            ...document.querySelectorAll('input[type="submit"]'),
+            ...document.querySelectorAll('[role="button"]'),
+            ...document.querySelectorAll('.x-btn'),
+            ...document.querySelectorAll('.x-btn-inner'),
+            ...document.querySelectorAll('.k-button')
+        ];
+
+        for (const element of elements) {
+            if (!isVisible(element)) continue;
+
+            const buttonText = normalizeText(
+                element.innerText ||
+                element.value ||
+                element.textContent
+            );
+
+            if (buttonText === wanted) {
+                // Если нашли внутренний span ExtJS,
+                // нажимаем именно родительскую кнопку
+                if (element.classList.contains('x-btn-inner')) {
+                    return element.closest('.x-btn') || element;
+                }
+
+                return element;
+            }
+        }
+
+        return null;
+    }
+
+
+    // ============================================================
+    // ПЕЧАТЬ
+    // ============================================================
+
+    function printMedicalRecord() {
+
+        const button = findButtonExact('Печать');
+
+        if (!button) {
+            log('Кнопка «Печать» не найдена');
+            return false;
+        }
+
+        log('Ctrl+P → Печать');
+
+        button.click();
+
+        return true;
+    }
+
+
+    // ============================================================
+    // HOTKEYS
+    // ============================================================
+
+    function saveMedicalRecord(event) {
+
+        try {
+
+            const iframe = document.querySelector(
+                'iframe[id^="iframeMedRec_"]'
+            );
+
+            let medicalRecordId = null;
+
+            if (iframe) {
+                const match = iframe.id.match(/^iframeMedRec_(\d+)$/);
+
+                if (match) {
+                    medicalRecordId = match[1];
+                }
+            }
+
+            // Если iframe не найден — ищем текущую medical record
+            if (!medicalRecordId) {
+
+                const keys = Object.keys(window.MedicalRecords || {});
+
+                const mdKey = keys.find(key =>
+                    /^md_\d+$/.test(key)
+                );
+
+                if (mdKey) {
+                    medicalRecordId = mdKey.replace('md_', '');
+                }
+            }
+
+            if (!medicalRecordId) {
+                log('Ctrl+S: текущая медицинская запись не найдена');
+                return false;
+            }
+
+            const medicalRecordKey =
+                'md_' + medicalRecordId;
+
+            const medicalRecord =
+                window.MedicalRecords &&
+                window.MedicalRecords[medicalRecordKey];
+
+            if (
+                !medicalRecord ||
+                typeof medicalRecord.saveMedicalRecordDocumentText !== 'function'
+            ) {
+                log(
+                    'Ctrl+S: функция saveMedicalRecordDocumentText не найдена',
+                    medicalRecordKey
+                );
+                return false;
+            }
+
+            log(
+                'Ctrl+S → штатное сохранение DMED:',
+                medicalRecordKey
+            );
+
+            if (event && typeof event.preventDefault === 'function') {
+                event.preventDefault();
+            }
+
+            medicalRecord.saveMedicalRecordDocumentText(event);
+
+            return true;
+
+        } catch (error) {
+
+            console.error(
+                '[DMED HELPER] Ошибка Ctrl+S:',
+                error
+            );
+
+            return false;
+        }
+    }
+
+
+    function handleDmedHotkey(event) {
+
+        // Ctrl + S
+        if (
+            SETTINGS.saveHotkey &&
+            event.ctrlKey &&
+            !event.shiftKey &&
+            !event.altKey &&
+            (
+                event.key.toLowerCase() === 's' ||
+                event.code === 'KeyS'
+            )
+        ) {
+
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+
+            log('Ctrl+S перехвачен');
+
+            saveMedicalRecord();
+
+            return false;
+        }
+
+
+        // Ctrl + P
+        if (
+            SETTINGS.printHotkey &&
+            event.ctrlKey &&
+            !event.shiftKey &&
+            !event.altKey &&
+            (
+                event.key.toLowerCase() === 'p' ||
+                event.code === 'KeyP'
+            )
+        ) {
+
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
+
+            log('Ctrl+P перехвачен');
+
+            printMedicalRecord();
+
+            return false;
+        }
+    }
+
+
+    // Ловим максимально рано
+    window.addEventListener(
+        'keydown',
+        handleDmedHotkey,
+        {
+            capture: true
+        }
+    );
+
+
+    document.addEventListener(
+        'keydown',
+        handleDmedHotkey,
+        {
+            capture: true
+        }
+    );
+
+
+    // ============================================================
+    // CTRL+S ВНУТРИ РЕДАКТОРА DMED
+    // ============================================================
+
+    function attachSaveHotkeyToIframe(iframe) {
+
+        if (!iframe || iframe.dataset.dmedSaveHotkeyAttached === '1') {
+            return;
+        }
+
+        try {
+
+            const iframeDocument =
+                iframe.contentDocument ||
+                iframe.contentWindow.document;
+
+            if (!iframeDocument) {
+                return;
+            }
+
+            iframeDocument.addEventListener(
+                'keydown',
+                function (event) {
+
+                    if (
+                        !SETTINGS.saveHotkey ||
+                        !event.ctrlKey ||
+                        event.shiftKey ||
+                        event.altKey ||
+                        (
+                            event.key.toLowerCase() !== 's' &&
+                            event.code !== 'KeyS'
+                        )
+                    ) {
+                        return;
+                    }
+
+                    event.preventDefault();
+                    event.stopPropagation();
+                    event.stopImmediatePropagation();
+
+                    log('Ctrl+S перехвачен внутри редактора DMED');
+
+                    saveMedicalRecord(event);
+
+                },
+                true
+            );
+
+            iframe.dataset.dmedSaveHotkeyAttached = '1';
+
+            log(
+                'Ctrl+S подключен к iframe:',
+                iframe.id
+            );
+
+        } catch (error) {
+
+            log(
+                'Не удалось подключить Ctrl+S к iframe:',
+                iframe.id,
+                error
+            );
+        }
+    }
+
+
+    function scanMedicalRecordIframes() {
+
+        document
+            .querySelectorAll('iframe[id^="iframeMedRec_"]')
+            .forEach(attachSaveHotkeyToIframe);
+    }
+
+
+    scanMedicalRecordIframes();
+
+
+    setInterval(
+        scanMedicalRecordIframes,
+        500
+    );
+
+
+    // ============================================================
+    // ПОИСК POPUP
+    // ============================================================
+
+    function getPossiblePopupElements(root) {
+
+        const selectors = [
+            '.modal',
+            '.k-window',
+            '.k-dialog',
+            '.k-notification',
+            '.alert',
+            '.toast',
+            '.bootbox',
+            '.x-window',
+            '.x-message-box',
+            '[role="dialog"]'
+        ];
+
+        const result = [];
+
+        for (const selector of selectors) {
+
+            if (root.matches && root.matches(selector)) {
+                result.push(root);
+            }
+
+            if (root.querySelectorAll) {
+                result.push(
+                    ...root.querySelectorAll(selector)
+                );
+            }
+        }
+
+        return result;
+    }
+
+
+    // ============================================================
+    // POPUP: 60 ДНЕЙ
+    // ============================================================
+
+    function handle60DaysPopup(element) {
+
+        if (!SETTINGS.autoConfirm60Days) {
+            return false;
+        }
+
+        if (!isVisible(element)) {
+            return false;
+        }
+
+        const text = normalizeText(element.innerText);
+
+        // Точное распознавание предупреждения:
+        // «Не найдено первичное обращение пациента
+        //  в текущую Медицинскую организацию
+        //  (в течение 60 дней). Вы хотите продолжить сохранение?»
+
+        const is60DaysPopup =
+            text.includes('не найдено первичное обращение') &&
+            text.includes('в течение 60 дней') &&
+            text.includes('продолжить сохранение');
+
+        if (!is60DaysPopup) {
+            return false;
+        }
+
+        log(
+            'Найден popup «60 дней» → автоматически нажимаем «Да»'
+        );
+
+        const buttons = [
+            ...element.querySelectorAll('button'),
+            ...element.querySelectorAll('input[type="button"]'),
+            ...element.querySelectorAll('input[type="submit"]'),
+            ...element.querySelectorAll('a'),
+            ...element.querySelectorAll('[role="button"]'),
+            ...element.querySelectorAll('.x-btn'),
+            ...element.querySelectorAll('.x-btn-inner')
+        ];
+
+        const yesButton = buttons.find(button => {
+
+            const buttonText = normalizeText(
+                button.innerText ||
+                button.value ||
+                button.textContent
+            );
+
+            return (
+                buttonText === 'да' ||
+                buttonText === 'yes'
+            );
+        });
+
+        if (yesButton) {
+
+            const realButton =
+                yesButton.classList.contains('x-btn-inner')
+                    ? (yesButton.closest('.x-btn') || yesButton)
+                    : yesButton;
+
+            realButton.click();
+
+            log(
+                'Popup «60 дней» подтвержден автоматически'
+            );
+
+            return true;
+        }
+
+        log('Кнопка «Да» не найдена');
+
+        return false;
+    }
+
+
+    // ============================================================
+    // POPUP: ЗАПИСЬ НА ПРОШЕДШЕЕ ВРЕМЯ
+    // ============================================================
+
+    function handlePastTimePopup(element) {
+
+        if (!SETTINGS.autoConfirmPastTime) {
+            return false;
+        }
+
+        if (!isVisible(element)) {
+            return false;
+        }
+
+        const text = normalizeText(element.innerText);
+
+        // Предупреждение:
+        // «Вы записываете пациента на уже прошедшее время...
+        //  Вы уверены, что хотите продолжить запись?»
+
+        const isPastTimePopup =
+            text.includes('записываете пациента') &&
+            text.includes('уже прошедшее время') &&
+            text.includes('хотите продолжить');
+
+        if (!isPastTimePopup) {
+            return false;
+        }
+
+        log(
+            'Найден popup «прошедшее время» → автоматически нажимаем «Да»'
+        );
+
+        const buttons = [
+            ...element.querySelectorAll('button'),
+            ...element.querySelectorAll('input[type="button"]'),
+            ...element.querySelectorAll('input[type="submit"]'),
+            ...element.querySelectorAll('a'),
+            ...element.querySelectorAll('[role="button"]'),
+            ...element.querySelectorAll('.x-btn'),
+            ...element.querySelectorAll('.x-btn-inner')
+        ];
+
+        const yesButton = buttons.find(button => {
+
+            const buttonText = normalizeText(
+                button.innerText ||
+                button.value ||
+                button.textContent
+            );
+
+            return (
+                buttonText === 'да' ||
+                buttonText === 'yes'
+            );
+        });
+
+        if (yesButton) {
+
+            const realButton =
+                yesButton.classList.contains('x-btn-inner')
+                    ? (yesButton.closest('.x-btn') || yesButton)
+                    : yesButton;
+
+            realButton.click();
+
+            log(
+                'Popup «прошедшее время» подтвержден автоматически'
+            );
+
+            return true;
+        }
+
+        log('Кнопка «Да» не найдена');
+
+        return false;
+    }
+
+
+    // ============================================================
+    // POPUP: ПРОВЕРКА ДАННЫХ ПАЦИЕНТА
+    // ============================================================
+
+    function handlePatientDataCheckPopup(element) {
+
+        if (!SETTINGS.autoConfirmPatientDataCheck) {
+            return false;
+        }
+
+        if (!isVisible(element)) {
+            return false;
+        }
+
+        const text = normalizeText(element.innerText);
+
+        // Предупреждение:
+        // «На данный момент сервис ... данные пациента невозможно ...
+        //  ... проверить ...?»
+
+        const isPatientDataCheckPopup =
+            text.includes('на данный момент сервис') &&
+            text.includes('данные пациента') &&
+            text.includes('проверить');
+
+        if (!isPatientDataCheckPopup) {
+            return false;
+        }
+
+        log(
+            'Найден popup «проверка данных пациента» → автоматически нажимаем «Да»'
+        );
+
+        const buttons = [
+            ...element.querySelectorAll('button'),
+            ...element.querySelectorAll('input[type="button"]'),
+            ...element.querySelectorAll('input[type="submit"]'),
+            ...element.querySelectorAll('a'),
+            ...element.querySelectorAll('[role="button"]'),
+            ...element.querySelectorAll('.x-btn'),
+            ...element.querySelectorAll('.x-btn-inner')
+        ];
+
+        const yesButton = buttons.find(button => {
+
+            const buttonText = normalizeText(
+                button.innerText ||
+                button.value ||
+                button.textContent
+            );
+
+            return (
+                buttonText === 'да' ||
+                buttonText === 'yes'
+            );
+        });
+
+        if (yesButton) {
+
+            const realButton =
+                yesButton.classList.contains('x-btn-inner')
+                    ? (yesButton.closest('.x-btn') || yesButton)
+                    : yesButton;
+
+            realButton.click();
+
+            log(
+                'Popup «проверка данных пациента» подтвержден автоматически'
+            );
+
+            return true;
+        }
+
+        log('Кнопка «Да» не найдена');
+
+        return false;
+    }
+
+
+    // ============================================================
+    // POPUP: «ДОБАВИТЬ КАК РЕКОМЕНДАЦИЮ»
+    // ============================================================
+
+    function handleRecommendationPopup(element) {
+
+        if (!SETTINGS.hideRecommendationPopup) {
+            return false;
+        }
+
+        if (!isVisible(element)) {
+            return false;
+        }
+
+        const text = normalizeText(element.innerText);
+
+
+        const isRecommendationPopup =
+            (
+                text.includes('рекомендац') &&
+                (
+                    text.includes('добавить') ||
+                    text.includes('добавить как')
+                )
+            );
+
+
+        if (!isRecommendationPopup) {
+            return false;
+        }
+
+
+        // Не удаляем саму медицинскую запись.
+        // Закрываем только popup.
+
+        log('Убираем ненужный popup рекомендаций');
+
+
+        // Сначала нажимаем штатную кнопку «Нет»
+        const buttons = [
+            ...element.querySelectorAll('button'),
+            ...element.querySelectorAll('input[type="button"]'),
+            ...element.querySelectorAll('input[type="submit"]'),
+            ...element.querySelectorAll('a'),
+            ...element.querySelectorAll('[role="button"]'),
+            ...element.querySelectorAll('.x-btn'),
+            ...element.querySelectorAll('.x-btn-inner')
+        ];
+
+
+        const noButton = buttons.find(button => {
+
+            const buttonText = normalizeText(
+                button.innerText ||
+                button.value ||
+                button.textContent
+            );
+
+            return (
+                buttonText === 'нет' ||
+                buttonText === 'no'
+            );
+        });
+
+
+        if (noButton) {
+
+            const realButton =
+                noButton.classList.contains('x-btn-inner')
+                    ? (noButton.closest('.x-btn') || noButton)
+                    : noButton;
+
+            realButton.click();
+
+            log('Popup рекомендаций закрыт через «Нет»');
+
+            return true;
+        }
+
+
+        // Если кнопки «Нет» нет — пытаемся закрыть штатно
+        const closeButton =
+            element.querySelector(
+                '.close, .x-tool-close, [aria-label="Close"], [aria-label="Закрыть"], [data-dismiss="modal"]'
+            );
+
+
+        if (closeButton) {
+
+            closeButton.click();
+
+            log('Popup рекомендаций закрыт через крестик');
+
+            return true;
+        }
+
+
+        // Крайний вариант — скрываем именно popup.
+        element.style.display = 'none';
+
+        log('Popup рекомендаций скрыт принудительно');
+
+        return true;
+    }
+
+
+    // ============================================================
+    // ОБРАБОТКА POPUP
+    // ============================================================
+
+    function processPopup(element) {
+
+        if (!element || !isVisible(element)) {
+            return;
+        }
+
+
+        // Сначала 60 дней
+        if (handle60DaysPopup(element)) {
+            return;
+        }
+
+
+        // Запись на прошедшее время
+        if (handlePastTimePopup(element)) {
+            return;
+        }
+
+
+        // Проверка данных пациента
+        if (handlePatientDataCheckPopup(element)) {
+            return;
+        }
+
+
+        // Потом рекомендации
+        handleRecommendationPopup(element);
+    }
+
+
+    // ============================================================
+    // MUTATION OBSERVER
+    // ============================================================
+
+    const observer = new MutationObserver(
+        function (mutations) {
+
+            for (const mutation of mutations) {
+
+                for (const node of mutation.addedNodes) {
+
+                    if (node.nodeType !== Node.ELEMENT_NODE) {
+                        continue;
+                    }
+
+
+                    const elements =
+                        getPossiblePopupElements(node);
+
+
+                    for (const element of elements) {
+
+                        processPopup(element);
+
+                    }
+
+                }
+
+            }
+
+        }
+    );
+
+
+    observer.observe(
+        document.documentElement,
+        {
+            childList: true,
+            subtree: true
+        }
+    );
+
+
+    // ============================================================
+    // ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА
+    // ============================================================
+
+    // DMED иногда меняет содержимое уже существующего popup,
+    // не создавая новый DOM-элемент.
+
+    setInterval(
+        function () {
+
+            const popupSelectors = [
+                '.modal',
+                '.k-window',
+                '.k-dialog',
+                '.k-notification',
+                '.alert',
+                '.toast',
+                '.bootbox',
+                '.x-window',
+                '.x-message-box',
+                '[role="dialog"]'
+            ];
+
+            for (const selector of popupSelectors) {
+
+                document
+                    .querySelectorAll(selector)
+                    .forEach(processPopup);
+
+            }
+
+        },
+        300
+    );
+
+
+    // ============================================================
+    // START
+    // ============================================================
+
+    log('Cleaner + Hotkeys запущен');
+
+})();

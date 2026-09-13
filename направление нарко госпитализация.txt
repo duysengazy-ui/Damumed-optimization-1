@@ -1,0 +1,154 @@
+// ==UserScript==
+// @name         Damumed — направление на госпитализацию
+// @namespace    local.damumed.hospitalization
+// @version      1.0.8
+// @description  Заполняет плановую госпитализацию через штатную форму и оставляет её в состоянии «Не отправлено».
+// @match        https://doc-ast.dmed.kz/MedicalRecords*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(() => {
+  'use strict';
+  if (window.top !== window.self || document.getElementById('local-hospitalization-helper')) return;
+
+  const norm = value => String(value ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  const read = (item, key) => item && (typeof item.get === 'function' ? item.get(key) : item[key]);
+  const itemText = item => {
+    if (!item) return '';
+    const values = typeof item.toJSON === 'function' ? item.toJSON() : item;
+    return Object.values(values || {}).filter(value => typeof value === 'string').map(norm).join(' ');
+  };
+  const visible = el => !!el?.isConnected && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+  const fail = text => { throw new Error(text); };
+  const one = (scope, selector) => {
+    let found = [...scope.querySelectorAll(selector)];
+    const activeWindow = found.filter(el => {
+      const win = el.closest('.k-window, .modal');
+      return !win || visible(win);
+    });
+    if (activeWindow.length) found = activeWindow;
+    if (selector === '#cmbSick') {
+      const diagnosis = found.filter(el => el.closest('#frmPreliminaryDiagnosis'));
+      if (diagnosis.length) found = diagnosis;
+    }
+    if (found.length !== 1) fail('Не удалось однозначно найти ' + selector + '. Продолжите вручную.');
+    return found[0];
+  };
+
+  const host = document.createElement('div');
+  host.id = 'local-hospitalization-helper';
+  const style = document.createElement('style');
+  style.textContent = '#local-hospitalization-helper{position:fixed;top:3px;right:360px;z-index:2147483646;font:14px Arial;color:#172333}#local-hospitalization-helper button{font:14px Arial;padding:6px 9px;cursor:pointer}#local-hospitalization-helper button:disabled{cursor:default}#local-hospitalization-helper .h-panel{position:fixed;right:18px;top:44px;width:min(560px,calc(100vw - 48px));max-height:calc(100vh - 90px);overflow:auto;background:#fff;border:2px solid #456;border-radius:6px;padding:14px;box-shadow:0 8px 24px #0004}#local-hospitalization-helper .h-status{white-space:pre-wrap;line-height:1.4}#local-hospitalization-helper label{display:block;margin:12px 0}';
+  host.append(style); document.documentElement.append(host);
+  const button = (text, fn, scope = host) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = text; b.addEventListener('click', fn); scope.append(b); return b; };
+  const launcher = button('Госпитализация', openPanel);
+  const dock = () => { const three = document.getElementById('local-three-referrals'); const r = three?.getBoundingClientRect(); host.style.right = (r?.left ? Math.max(360, innerWidth - r.left + 8) : 360) + 'px'; };
+  window.addEventListener('resize', dock); dock();
+
+  let panel = null, status = null, confirm = null, start = null, busy = false;
+  const report = text => { if (status) status.textContent = text; };
+  const context = () => {
+    const frames = [...document.querySelectorAll('iframe[id^="iframeMedRec_"]')];
+    if (frames.length === 1 && visible(frames[0])) {
+      const id = frames[0].id.slice('iframeMedRec_'.length), body = frames[0].contentDocument?.querySelector('body[id^="editor_"][contenteditable="true"]');
+      if (body && /^\d+$/.test(id)) return { frame: frames[0], body, id, text: body.innerText, url: location.href };
+    }
+    const editors = [...document.querySelectorAll('[id^="editor_"][contenteditable="true"]')].filter(visible);
+    if (editors.length !== 1) fail('Откройте одну медзапись и дождитесь загрузки редактора.');
+    const body = editors[0], id = body.id.slice('editor_'.length);
+    if (!/^\d+$/.test(id)) fail('Редактор текущей записи недоступен.');
+    return { frame: null, body, id, text: body.innerText, url: location.href };
+  };
+  let run = null;
+  const guard = () => { if (!run || run.cancelled) fail('Выполнение остановлено.'); const c = context(); if (c.url !== run.context.url || c.frame !== run.context.frame || c.body !== run.context.body || c.id !== run.context.id || c.text !== run.context.text) fail('Медзапись изменилась. Работа остановлена.'); };
+  async function wait(readValue, label, timeout = 15000) { const end = Date.now() + timeout; do { guard(); const value = readValue(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 100)); } while (Date.now() < end); fail(label + ': результат не подтверждён. Проверьте форму вручную.'); }
+  function widget(form, id) { const el = one(form, '#' + id), jq = window.jQuery?.(el), w = jq?.data('kendoComboBox') || jq?.data('kendoDropDownList'); if (!w || typeof w.select !== 'function' || typeof w.trigger !== 'function') fail('Недоступен Kendo-виджет ' + id + '.'); return w; }
+  function selected(w) { const i = w.select(); const item = i >= 0 ? w.dataItem(i) : null; return item && String(w.value() ?? '') && String(read(item, w.options.dataValueField)) === String(w.value()) ? item : null; }
+  function formGuard(form) { guard(); if (!form.isConnected || !document.querySelector('#wndEditDirection #frmEditDirection')?.isConnected) fail('Форма госпитализации изменилась. Автоматизация остановлена.'); }
+  async function choose(form, id, predicate, query, replace = false, reload = true, allowFirst = false) {
+    formGuard(form); const w = widget(form, id), existing = selected(w);
+    if (existing) {
+      if (predicate(existing)) return existing;
+      if (!replace) fail('Поле ' + id + ' уже содержит другое значение. Оно не заменено.');
+      w.value(null); w.trigger('change');
+    } else if (String(w.value() ?? '') || norm(w.text())) fail('Поле ' + id + ' уже заполнено другим значением. Проверьте вручную.');
+    if (query && typeof w.search === 'function') w.search(query);
+    else if (query && w.input) w.input.val(query);
+    if (typeof w.open === 'function') w.open();
+    if (reload) await w.dataSource.read();
+    formGuard(form);
+    const matches = Array.from(w.dataSource.view()).map((item, index) => ({ item, index })).filter(x => predicate(x.item));
+    if (matches.length !== 1 && !(allowFirst && matches.length > 0)) {
+      const labels = { cmbRefType: 'Кем направлен', cmbHospitalMo: 'МО госпитализации', cmbBedProfile: 'Профиль койки', cmbNoticeTarget: 'Цель направления', cmbBenefitType: 'Категория льготности', cmbResidenceType: 'Тип жителя', cmbRegPersonAddress: 'Адрес', cmbFinanceSource: 'Источник финансирования', cmbSick: 'Направительный диагноз' };
+      fail((labels[id] || id) + ': не найден единственный вариант в выпадающем списке. Выберите вручную.');
+    }
+    const { item, index } = matches[0];
+    const value = read(item, w.options.dataValueField), text = read(item, w.options.dataTextField) || itemText(item);
+    w.select(index); w.value(String(value));
+    if (w.input) { w.input.val(String(text ?? '')); w.input.trigger('input'); w.input.trigger('blur'); }
+    w.trigger('change'); if (typeof w.close === 'function') w.close();
+    await wait(() => { formGuard(form); const current = selected(w); return current && predicate(current); }, 'Выбор ' + id);
+    return item;
+  }
+  async function first(form, id, predicate, query, reload = true, allowFirst = false) { return choose(form, id, predicate || (() => true), query, false, reload, allowFirst); }
+  async function prepare(dialog) {
+    const form = one(dialog, '#frmEditDirection');
+    const card = one(form, '#tbCardNumber'); if (!norm(card.value)) { card.value = '1111'; card.dispatchEvent(new Event('change', { bubbles: true })); }
+    await choose(form, 'cmbRefType', item => /КДП/i.test(itemText(item)), 'КДП', true);
+    await choose(form, 'cmbHospitalMo', item => /городской центр психического здоровья/i.test(itemText(item)), 'Псих');
+    const branch = form.querySelector('#divFuncStructureBranch:not(.hide) #cmdFuncStructureBrach'); if (branch && visible(branch)) fail('Появилось обязательное поле «Филиал/Служба». Выберите его вручную.');
+    await choose(form, 'cmbBedProfile', item => /наркологическ/i.test(itemText(item)) && /взросл/i.test(itemText(item)), 'наркологический');
+    await choose(form, 'cmbNoticeTarget', item => /консервативн.*лечен/i.test(itemText(item)), 'консервативное лечение');
+    await choose(form, 'cmbBenefitType', item => /проч(ее|ие)/i.test(itemText(item)), 'прочие', true);
+    await choose(form, 'cmbResidenceType', item => itemText(item).toLowerCase().includes('город') && !itemText(item).toLowerCase().includes('село'), 'город', true);
+    await first(form, 'cmbRegPersonAddress', item => !!read(item, 'ID') || !!read(item, 'MasterDataID'));
+    const payment = selected(widget(form, 'rbHdPaymentTypeFilter')); if (!payment || !/государствен/i.test(norm(read(payment, 'Name')))) fail('Тип оплаты не государственный. Проверьте вручную.');
+    const diagnosisForm = one(dialog, '#frmPreliminaryDiagnosis');
+    const sickWidget = widget(diagnosisForm, 'cmbSick');
+    await wait(() => sickWidget.dataSource.view().length > 0, 'Загрузка диагнозов текущей медзаписи');
+    const diag = await first(diagnosisForm, 'cmbSick', () => true, undefined, false, true); if (!diag) fail('Направительный диагноз не выбран.');
+    const add = one(diagnosisForm, 'button[onclick*="EditDirection.onAddDiagnosis"]'); add.click();
+    await wait(() => { const grid = window.jQuery?.('#grdSendDiagnoses').data('kendoGrid'); const data = grid?.dataSource?.data?.() || []; return data.some(item => read(item, 'DiagnosTypeID') == 2 && read(item, 'DiagnosisTypeID') == 2); }, 'Добавление направительного диагноза');
+    const finance = widget(form, 'cmbFinanceSource'); await wait(() => finance.dataSource.view().length > 0, 'Загрузка источника финансирования'); if (!selected(finance)) await first(form, 'cmbFinanceSource', () => true);
+    formGuard(form); return form;
+  }
+  async function execute() {
+    if (busy) return;
+    if (!run) {
+      try { run = { context: context(), cancelled: false }; }
+      catch (error) { report(error.message); return; }
+    }
+    busy = true; start.disabled = true;
+    report('Запуск автоматизации… Проверяю текущую медзапись.');
+    try {
+      guard();
+      if (typeof window.Directions?.onAddClick !== 'function') {
+        const link = document.querySelector('#MedRecordPanelBar_' + run.context.id + ' a[href*="/HospitalDirection/Directions"]') || document.querySelector('a[href*="/HospitalDirection/Directions"]');
+        if (!link) fail('Раздел «Направления на госпитализацию» не найден. Откройте его вручную.');
+        link.click();
+        await wait(() => typeof window.Directions?.onAddClick === 'function', 'Загрузка раздела госпитализации');
+      }
+      if (document.querySelector('#wndEditDirection #frmEditDirection')) fail('Форма госпитализации уже открыта. Завершите её вручную.');
+      window.Directions.onAddClick(0, 1, 40);
+      const dialog = await wait(() => { const f = document.querySelector('#wndEditDirection #frmEditDirection'); return f && visible(f) ? document.querySelector('#wndEditDirection') : null; }, 'Открытие формы госпитализации');
+      const form = await prepare(dialog); formGuard(form);
+      const save = one(dialog, 'button[onclick*="EditDirection.onSaveClick"]'); if (save.disabled || save.getAttribute('aria-disabled') === 'true') fail('Штатная кнопка «Сохранить» отключена Damumed. Проверьте форму вручную.');
+      save.click();
+      await wait(() => !document.querySelector('#wndEditDirection #frmEditDirection') || !visible(document.querySelector('#wndEditDirection #frmEditDirection')), 'Сохранение направления', 20000);
+      report('Направление создано и сохранено в состоянии «Не отправлено». Кнопки «Отправить» и печати не нажимались.');
+    } catch (error) { report(error.message + '\nНаправление не отправлено автоматически. Завершите форму вручную.'); }
+    finally { busy = false; start.disabled = false; }
+  }
+  function openPanel() {
+    if (panel) { panel.remove(); panel = null; return; }
+    run = null;
+    panel = document.createElement('div'); panel.className = 'h-panel';
+    panel.innerHTML = '<b>Плановая госпитализация</b><div class="h-status">Проверьте пациента и поля, затем разрешите создание.</div>';
+    status = panel.querySelector('.h-status');
+    const label = document.createElement('label'); confirm = document.createElement('input'); confirm.type = 'checkbox'; label.append(confirm, ' Пациент проверен, разрешаю создать направление'); panel.append(label);
+    start = button('Создать направление', execute, panel); start.disabled = true; confirm.addEventListener('change', () => { start.disabled = !confirm.checked; });
+    button('Закрыть', () => { if (!busy) { panel.remove(); panel = null; } }, panel); host.append(panel);
+  }
+})();

@@ -1,0 +1,264 @@
+// ==UserScript==
+// @name         Damumed — три направления КДУ
+// @namespace    local.damumed.three-referrals
+// @version      1.1.0
+// @description  Одна выбранная услуга: психолог, психотерапевт или социальный работник через штатную форму.
+// @match        https://doc-ast.dmed.kz/MedicalRecords*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// ==/UserScript==
+
+(() => {
+  'use strict';
+  if (window.top !== window.self || document.getElementById('local-three-referrals')) return;
+  const services = [
+    { code: 'A01.005.000', name: 'Прием: Психолог', query: 'психолог' },
+    { code: 'A02.045.000', name: 'Консультация: Психотерапевт', query: 'психотерапевт' },
+    { code: 'A01.006.000', name: 'Прием: Социальный работник с высшим образованием', query: 'социальный работник' }
+  ];
+  const norm = value => String(value ?? '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  const read = (item, key) => item && (typeof item.get === 'function' ? item.get(key) : item[key]);
+  const visible = el => !!el?.isConnected && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+  const fail = text => { throw new Error(text); };
+  const single = (scope, selector) => {
+    const found = scope.querySelectorAll(selector);
+    if (found.length !== 1) fail('Не удалось однозначно найти элемент ' + selector + '. Продолжите вручную.');
+    return found[0];
+  };
+  const host = document.createElement('div'); host.id = 'local-three-referrals';
+  // Обычный DOM: старым обработчикам jQuery не передаётся ShadowRoot.
+  const style = document.createElement('style');
+  style.textContent = '#local-three-referrals{position:fixed;top:3px;right:200px;z-index:2147483646;font:14px Arial;color:#172333}#local-three-referrals button{font:14px Arial;padding:6px 9px;cursor:pointer}#local-three-referrals button:disabled{cursor:default}#local-three-referrals .tr-panel{position:fixed;right:18px;top:44px;width:min(540px,calc(100vw - 48px));max-height:calc(100vh - 90px);overflow:auto;background:white;border:2px solid #456;border-radius:6px;padding:14px;box-shadow:0 8px 24px #0004}#local-three-referrals .tr-status{white-space:pre-wrap;line-height:1.4}#local-three-referrals label{display:block;margin:12px 0}#local-three-referrals button+button{margin-left:6px}#MedRecEditorTabLinks{width:calc(100% - 400px)!important;box-sizing:border-box}';
+  host.append(style); document.documentElement.append(host);
+  const button = (text, fn, scope = host) => {
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = text; b.addEventListener('click', fn); scope.append(b); return b;
+  };
+  const launcher = button('Три направления', openPanel);
+  const dock = () => {
+    const vkk = document.getElementById('local-vkk-helper');
+    const rect = vkk?.getBoundingClientRect();
+    host.style.right = (rect?.width ? Math.max(200, innerWidth - rect.left + 8) : 200) + 'px';
+  };
+  window.addEventListener('resize', dock); dock();
+  let panel, status, confirm, start, resume, stop, run = null, busy = false;
+  function report(text) { if (status) status.textContent = text; }
+  function context() {
+    const frames = [...document.querySelectorAll('iframe[id^="iframeMedRec_"]')];
+    if (frames.length !== 1 || !visible(frames[0])) fail('Откройте ровно одну медзапись.');
+    const frame = frames[0], id = frame.id.slice('iframeMedRec_'.length);
+    const body = frame.contentDocument?.querySelector('body[id^="editor_"][contenteditable="true"]');
+    if (!body || !/^\d+$/.test(id)) fail('Редактор текущей записи недоступен.');
+    const link = single(document, '#Assignments a[href*="/MedicalRecords/MedicalRecordDestinations?"]');
+    if (new URL(link.href).searchParams.get('MedRecordID') !== id) fail('Раздел назначений относится к другой медзаписи.');
+    return { frame, body, id, text: body.innerText, url: location.href, link };
+  }
+  function guard() {
+    if (!run || run.cancelled) fail('Выполнение остановлено.');
+    const c = context(), old = run.context;
+    if (c.url !== old.url || c.frame !== old.frame || c.body !== old.body || c.id !== old.id || c.text !== old.text) fail('Медзапись изменилась. Работа остановлена; проверьте уже созданные направления.');
+  }
+  async function wait(readValue, label, timeout = 12000) {
+    const end = Date.now() + timeout;
+    do {
+      guard(); const value = readValue(); if (value) return value;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } while (Date.now() < end);
+    fail(label + ': результат не подтверждён. Проверьте форму вручную.');
+  }
+  function activeDialog() { return [...document.querySelectorAll('#dlgCreateAssignment')].find(visible); }
+  function widget(form, id) {
+    const el = single(form, '#' + id), jq = window.jQuery?.(el);
+    const w = jq?.data('kendoComboBox') || jq?.data('kendoDropDownList');
+    if (!w?.options || typeof w.select !== 'function' || typeof w.trigger !== 'function') fail('Недоступен Kendo-виджет: ' + id);
+    return w;
+  }
+  function selected(w) {
+    const index = w.select();
+    const item = index >= 0 ? w.dataItem(index) : null;
+    if (!item || !String(w.value() ?? '') || String(read(item, w.options.dataValueField)) !== String(w.value())) return null;
+    return item;
+  }
+  function formGuard(form) {
+    guard();
+    if (!form.isConnected || activeDialog()?.querySelector('#formReferral') !== form) fail('Форма КДУ изменилась. Автоматизация остановлена.');
+  }
+  async function choose(form, id, predicate, query) {
+    formGuard(form);
+    const w = widget(form, id), existing = selected(w);
+    if (existing) {
+      if (predicate(existing)) return existing;
+      fail('Поле ' + id + ' уже содержит другое значение. Оно не заменено.');
+    }
+    if (String(w.value() ?? '') || (norm(w.text()) && norm(w.text()) !== norm(query))) fail('Поле ' + id + ' уже заполнено. Проверьте выбор вручную.');
+    if (w.element?.[0]?.disabled || w.input?.[0]?.readOnly) fail('Поле ' + id + ' недоступно.');
+    const before = String(w.value() ?? '');
+    if (query) w.input.val(query);
+    // Транспорт и параметры запроса определяет сама форма Damumed.
+    await w.dataSource.read(); formGuard(form);
+    if (String(w.value() ?? '') !== before) {
+      const item = selected(w);
+      if (item && predicate(item)) return item;
+      fail('Поле ' + id + ' изменилось во время загрузки.');
+    }
+    const items = Array.from(w.dataSource.view());
+    const matches = items.map((item, index) => ({ item, index })).filter(x => predicate(x.item));
+    if (matches.length !== 1) fail(id + ': нет единственного подходящего варианта. Выберите вручную.');
+    const { item, index } = matches[0];
+    w.select(index); w.trigger('change'); w.close();
+    await wait(() => {
+      formGuard(form); const current = selected(w);
+      return current && String(read(current, w.options.dataValueField)) === String(read(item, w.options.dataValueField)) && predicate(current);
+    }, 'Выбор ' + id);
+    return item;
+  }
+  function grid() {
+    const el = single(document, '#grdMedRecDestinations_' + run.context.id);
+    const w = window.jQuery?.(el).data('kendoGrid');
+    if (!w?.dataSource) fail('Таблица назначений недоступна.');
+    return w;
+  }
+  function rows() {
+    return Array.from(grid().dataSource.data()).filter(item => !read(item, 'DeleteDate'));
+  }
+  function matchesService(item, service) { return norm(read(item, 'PriceListPublicCode')) === service.code && !!read(item, 'ReferralItemId'); }
+  function unexpectedModal() {
+    return [...document.querySelectorAll('.modal')].find(el => visible(el) && el.id !== 'dlgCreateAssignment');
+  }
+  function fingerprint(form) {
+    return ['rbPaymentTypeFilter', 'cmbService', 'cmbRegion', 'cmbReceiver', 'cmbPricelistService', 'cmbTreatmentReasonParent', 'cmbTreatmentReason', 'cmbAssistancePlace', 'cmbSick'].map(id => {
+      const w = widget(form, id);
+      if (!selected(w)) fail('Поле ' + id + ' не содержит подтверждённого выбора.');
+      return String(w.value());
+    }).join('|');
+  }
+  async function prepare(service, dialog) {
+    const form = single(dialog, '#formReferral');
+    if (norm(widget(form, 'rbPaymentTypeFilter').text()) !== 'Государственные') fail('Тип оплаты отличается от государственных услуг. Проверьте форму вручную.');
+    await choose(form, 'cmbService', item => norm(read(item, 'PublicCode')) === service.code && norm(read(item, 'Name')).toLowerCase() === service.name.toLowerCase(), service.query);
+    await wait(() => {
+      formGuard(form);
+      return selected(widget(form, 'cmbRegion')) && selected(widget(form, 'cmbReceiver')) && selected(widget(form, 'cmbPricelistService'));
+    }, 'Получатель и услуга организации');
+    if (!/астана/i.test(widget(form, 'cmbRegion').text()) || !/центр психического здоровья/i.test(widget(form, 'cmbReceiver').text())) fail('Получатель отличается от центра психического здоровья в Астане. Проверьте вручную.');
+    if (norm(read(selected(widget(form, 'cmbPricelistService')), 'PublicCode')) !== service.code) fail('Код услуги организации не совпадает с выбранной услугой.');
+    for (const id of ['cmbTreatmentReasonParent', 'cmbTreatmentReason', 'cmbAssistancePlace']) {
+      if (!selected(widget(form, id))) fail('Проверьте обязательное поле ' + id + ' и продолжите.');
+    }
+    // Сохраняем выбранный в форме повод; при ошибке ЕПС диагноз и повод не меняем.
+    await choose(form, 'cmbSick', () => true);
+    const expected = fingerprint(form);
+    let finance = widget(form, 'cmbFinanceSource');
+    if (!selected(finance) || !single(form, '#txtFinanceSourceIdentifyGuid').value) {
+      const identify = single(form, '#btnIdentifyFinanceSource');
+      // В Damumed кнопка визуально активна, но свойство disabled иногда
+      // остаётся устаревшим после каскадной загрузки Kendo. Проверяем
+      // результат самого клика ниже; не блокируем на этом промежуточном флаге.
+      identify.click();
+      await wait(() => {
+        formGuard(form);
+        const modal = unexpectedModal();
+        if (modal) {
+          const text = norm(modal.querySelector('.modal-body')?.textContent);
+          // Закрываем только подтверждённое информационное уведомление.
+          if (/^Источник финансирования определился как ГОБМП\.?$/.test(text)) {
+            const ok = [...modal.querySelectorAll('button')].filter(b => norm(b.textContent).toLowerCase() === 'ок' && visible(b));
+            if (ok.length === 1) ok[0].click();
+          } else fail('Damumed показал сообщение. Прочитайте его и завершите проверку вручную.');
+        }
+        return selected(finance) && single(form, '#txtFinanceSourceIdentifyGuid').value && !unexpectedModal();
+      }, 'Определение финансирования. При ошибке ЕПС выберите обоснованный повод вручную и повторите определение', 20000);
+    }
+    if (norm(finance.text()) !== 'ГОБМП') fail('Источник финансирования отличается от ГОБМП. Автосохранение остановлено.');
+    const display = widget(form, 'cmbDisplaySick');
+    if (visible(display.wrapper?.[0])) {
+      await choose(form, 'cmbDisplaySick', item => norm(read(item, 'Mkb10Code')) === 'Z00.0' && norm(read(item, 'DisplayName')) === 'Общий медицинский осмотр', 'Общий медицинский осмотр');
+    }
+    formGuard(form);
+    if (fingerprint(form) !== expected || !selected(finance) || !single(form, '#txtFinanceSourceIdentifyGuid').value) fail('Поля изменились после определения финансирования. Проверьте и повторите определение вручную.');
+    if (unexpectedModal()) fail('Есть дополнительное окно Damumed. Завершите его вручную.');
+    // Дальнейшие проверки/подтверждения выполняет только штатная кнопка.
+    return form;
+  }
+  async function execute() {
+    if (busy || !run || run.cancelled) return;
+    busy = true; start.disabled = true; resume.disabled = true;
+    try {
+      guard();
+      if (!document.getElementById('grdMedRecDestinations_' + run.context.id)) {
+        run.context.link.click();
+        await wait(() => document.getElementById('grdMedRecDestinations_' + run.context.id), 'Загрузка назначений');
+      }
+      await grid().dataSource.read(); guard();
+      while (run.index < 1) {
+        const service = run.service;
+        report(run.messages.concat('Подготовка: ' + service.name).join('\n'));
+        if (run.sent) {
+          const found = rows().filter(item => matchesService(item, service) && !run.before.has(String(read(item, 'ReferralItemId'))));
+          if (found.length !== 1 || activeDialog()) fail('Результат сохранения не подтверждён. Завершите текущую форму вручную и нажмите «Проверить и продолжить». Повторно «Сохранить» скрипт не нажмёт.');
+          run.messages.push(service.name + ': появление направления подтверждено.');
+          run.index++; run.sent = false; run.dialog = null; continue;
+        }
+        if (!run.dialog && rows().some(item => matchesService(item, service))) {
+          run.messages.push(service.name + ': уже есть в назначениях этой записи; пропущено.'); run.index++; continue;
+        }
+        if (!run.dialog) {
+          if (activeDialog() || unexpectedModal()) fail('Закройте незавершённую форму перед запуском.');
+          const create = single(document, '#btnCreateAssignment_' + run.context.id);
+          create.click();
+          run.dialog = await wait(() => activeDialog()?.querySelector('#formReferral') ? activeDialog() : null, 'Открытие формы');
+        }
+        const form = await prepare(service, run.dialog);
+        formGuard(form);
+        run.before = new Set(rows().map(item => String(read(item, 'ReferralItemId'))));
+        const save = single(run.dialog, '#btnSaveAssignment');
+        if (save.disabled || save.getAttribute('aria-disabled') === 'true') fail('Сохранение отключено Damumed. Проверьте форму.');
+        run.sent = true; // Ставим до клика: никаких повторных отправок при тайм-ауте.
+        save.click();
+        await wait(() => {
+          const found = rows().filter(item => matchesService(item, service) && !run.before.has(String(read(item, 'ReferralItemId'))));
+          if (unexpectedModal()) fail('Damumed требует дополнительного решения. Выполните его вручную, затем проверьте продолжение.');
+          return found.length === 1 && !activeDialog();
+        }, 'Сохранение ' + service.name, 20000);
+      }
+      report(run.messages.concat('Выбранное направление завершено. Проверьте его в разделе «Назначения».').join('\n'));
+    } catch (error) {
+      report((run?.messages || []).concat(error.message, 'Следующие направления не создавались. Уже сохранённые остаются в Damumed.').join('\n'));
+    } finally {
+      busy = false;
+      resume.disabled = !run || run.cancelled || run.index >= 1;
+      stop.disabled = false;
+    }
+  }
+  function openPanel() {
+    if (panel) { panel.hidden = false; return; }
+    panel = document.createElement('section'); panel.className = 'tr-panel'; host.append(panel);
+    const text = document.createElement('p');
+    text.textContent = 'Выберите одно направление. Скрипт заполнит и сохранит только выбранную услугу через штатную форму Damumed.';
+    panel.append(text);
+    const picker = document.createElement('div'); picker.className = 'tr-picker'; panel.append(picker);
+    let chosen = null;
+    services.forEach(service => { const b = button(service.name, () => { chosen = service; for (const x of picker.querySelectorAll('button')) x.style.outline = x === b ? '2px solid #1565c0' : ''; start.disabled = false; report('Выбрано: ' + service.name + '. Проверьте пациента и нажмите «Создать выбранное направление».'); }, picker); b.title = service.code; });
+    const label = document.createElement('label'); confirm = document.createElement('input'); confirm.type = 'checkbox';
+    label.append(confirm, document.createTextNode('Пациент проверен; разрешаю создание выбранного направления.')); panel.append(label);
+    status = document.createElement('p'); status.className = 'tr-status'; status.setAttribute('role', 'status'); panel.append(status);
+    start = button('Создать выбранное направление', () => {
+      if (!confirm.checked || !chosen || busy || run) return;
+      try {
+        if (activeDialog() || unexpectedModal()) fail('Завершите открытую форму перед запуском.');
+        run = { context: context(), index: 0, service: chosen, messages: [], sent: false, cancelled: false, dialog: null };
+        execute();
+      } catch (error) { report(error.message); }
+    }, panel); start.disabled = true;
+    confirm.addEventListener('change', () => { start.disabled = !confirm.checked || !chosen || !!run || busy; });
+    resume = button('Проверить и продолжить', execute, panel); resume.disabled = true;
+    stop = button('Остановить', () => {
+      if (run) run.cancelled = true;
+      resume.disabled = true; start.disabled = true;
+      report('Остановлено. Уже отправленный запрос нельзя отменить этой кнопкой. Проверьте назначения и открытую форму.');
+    }, panel);
+    button('Скрыть', () => { panel.hidden = true; }, panel);
+    report('Повод обращения остаётся выбранным в Damumed. При ошибке ЕПС автоматической подмены на острое заболевание нет.');
+  }
+  window.addEventListener('pagehide', () => { if (run) run.cancelled = true; });
+})();
