@@ -21,7 +21,7 @@ const C={
  finance:'67',
  diagnosisCode:'F20.0',
  diagnosisName:'Параноидная шизофрения',
- sickId:'2326',
+ sickId:'2526',
  diagnosisType:'5',
  diagType:'2',
  charSick:'4',
@@ -120,14 +120,8 @@ function select(c,id){
  return String(c.getValue())===String(id);
 }
 
-
-// =========================================================
-// ПЕРВОЕ ОКНО — ЗАПИСЬ НА ПРИЁМ
-// =========================================================
-
 async function fillSchedule(w){
  const f=field(w,'GridScheduleID');
-
  if(!f)return;
 
  await waitStore(f);
@@ -143,7 +137,6 @@ async function fillSchedule(w){
 
 async function fillService(w){
  const f=field(w,'PricelistServicesMoID');
-
  if(!f)return;
 
  await waitStore(f);
@@ -159,7 +152,6 @@ async function fillService(w){
 
 function fillReadmission(w){
  const f=field(w,'ReadmissionID');
-
  if(!f)return;
 
  f.setValue(true);
@@ -171,13 +163,7 @@ function fillReadmission(w){
  log('✓ Повторный');
 }
 
-
-// =========================================================
-// ПОВОД ОБРАЩЕНИЯ
-// =========================================================
-
 async function fillTreatment(w){
-
  const n1=field(w,'node1');
  const n2=field(w,'node2');
 
@@ -201,27 +187,13 @@ async function fillTreatment(w){
  log('→ Заполняем повод обращения');
 
  try{
-
   if(typeof m.fillingLevelStore==='function'){
-
-   m.fillingLevelStore(
-    true,
-    [r1,r2],
-    2
-   );
-
+   m.fillingLevelStore(true,[r1,r2],2);
   }else{
-
-   throw new Error(
-    'fillingLevelStore отсутствует'
-   );
-
+   throw new Error('fillingLevelStore отсутствует');
   }
-
  }catch(e){
-
   try{
-
    m.clearCombo(-1);
    m.rec=[];
    m.fillingLevel=true;
@@ -230,110 +202,58 @@ async function fillTreatment(w){
    const c1=m.addCombo(0,0);
 
    if(c1){
-
     c1.getStore().loadData([r1]);
-
     c1.noRefresh=true;
     c1.setValue(C.treatment1);
     c1.noRefresh=false;
-
    }
 
-   const c2=m.addCombo(
-    C.treatment1,
-    1
-   );
+   const c2=m.addCombo(C.treatment1,1);
 
    if(c2){
-
     c2.getStore().loadData([r2]);
-
     c2.noRefresh=true;
     c2.setValue(C.treatment2);
     c2.noRefresh=false;
-
    }
 
    m.fillingLevel=false;
    m.isFilling=false;
-
   }catch(x){
-
-   log(
-    '❌ Ошибка повода обращения:',
-    x
-   );
-
+   log('❌ Ошибка повода обращения:',x);
    return false;
   }
  }
 
  await sleep(400);
 
-
- // ---------------------------------------------------------
- // СКРЫТОЕ TreatmentReasonID
- // ---------------------------------------------------------
-
- const hidden=field(
-  w,
-  'TreatmentReasonID'
- );
+ const hidden=field(w,'TreatmentReasonID');
 
  if(hidden){
-
-  hidden.setValue(
-   C.treatment2
-  );
+  hidden.setValue(C.treatment2);
 
   try{
-   hidden.fireEvent(
-    'change',
-    hidden,
-    C.treatment2,
-    null
-   );
+   hidden.fireEvent('change',hidden,C.treatment2,null);
   }catch(e){}
-
  }
 
-
- // ---------------------------------------------------------
- // objValue / validation
- // ---------------------------------------------------------
-
  try{
-
   if(m.objValue){
-
-   m.objValue.setValue(
-    C.treatment2
-   );
+   m.objValue.setValue(C.treatment2);
 
    try{
-    m.objValue.fireEvent(
-     'change',
-     m.objValue,
-     C.treatment2,
-     null
-    );
+    m.objValue.fireEvent('change',m.objValue,C.treatment2,null);
    }catch(e){}
-
   }
 
   m.rawData=C.treatment2;
 
-  if(
-   typeof m.validationCheck==='function'
-  ){
+  if(typeof m.validationCheck==='function'){
    m.validationCheck();
   }
-
  }catch(e){}
 
-
  await sleep(300);
-
 
  log(
   '✓ Повод обращения:',
@@ -342,90 +262,42 @@ async function fillTreatment(w){
   'TreatmentReasonID=',hidden?.getValue?.()
  );
 
- return (
-  String(
-   hidden?.getValue?.()
-  )===C.treatment2
- );
-
+ return String(hidden?.getValue?.())===C.treatment2;
 }
 
-
-// =========================================================
-// ИСТОЧНИК ФИНАНСИРОВАНИЯ
-// =========================================================
-
 async function fillFinance(w){
-
- const f=field(
-  w,
-  'FinanceSourceID'
- );
+ const f=field(w,'FinanceSourceID');
 
  if(!f){
-
-  log(
-   '⚠ FinanceSourceID не найден'
-  );
-
+  log('⚠ FinanceSourceID не найден');
   return false;
  }
 
-
  try{
-
-  if(
-   typeof w.financeSourceInit==='function'
-  ){
+  if(typeof w.financeSourceInit==='function'){
    w.financeSourceInit();
   }
-
  }catch(e){}
 
-
  await sleep(200);
-
  await waitStore(f);
 
-
  if(!rec(f,C.finance)){
-
-  log(
-   '⚠ Источник финансирования 67 не найден'
-  );
-
+  log('⚠ Источник финансирования 67 не найден');
   return false;
  }
 
-
- let ok=select(
-  f,
-  C.finance
- );
+ let ok=select(f,C.finance);
 
  if(!ok){
-
-  f.setValue(
-   C.finance
-  );
-
+  f.setValue(C.finance);
  }
 
-
  try{
-
-  f.fireEvent(
-   'change',
-   f,
-   C.finance,
-   null
-  );
-
+  f.fireEvent('change',f,C.finance,null);
  }catch(e){}
 
-
  await sleep(300);
-
 
  log(
   '✓ Источник финансирования:',
@@ -433,999 +305,541 @@ async function fillFinance(w){
   f.getRawValue()
  );
 
-
- return (
-  String(
-   f.getValue()
-  )===C.finance
- );
-
+ return String(f.getValue())===C.finance;
 }
-
-
-// =========================================================
-// ЗАПОЛНЕНИЕ ПЕРВОГО ОКНА
-// =========================================================
 
 async function fillBooking(w){
-
  await fillSchedule(w);
-
  await fillService(w);
-
  fillReadmission(w);
-
  await fillTreatment(w);
-
  await sleep(200);
-
  await fillFinance(w);
 
- log(
-  '✓ Первое окно заполнено'
- );
-
+ log('✓ Первое окно заполнено');
 }
-
-
-// =========================================================
-// ВТОРОЕ ОКНО — ПРИЁМ ПАЦИЕНТА
-// =========================================================
 
 async function fillDiagnosisType(w){
+ const f=
+   field(w,'DiagnosisTypeID')||
+   byLabel(w,'Тип диагноза');
 
-  const f =
-    field(w,'DiagnosisTypeID') ||
-    byLabel(w,'Тип диагноза');
+ if(!f){
+  log('⚠ Тип диагноза не найден');
+  return false;
+ }
 
-  if(!f){
-    log('⚠ Тип диагноза не найден');
-    return false;
-  }
+ await waitStore(f);
 
-  await waitStore(f);
+ const store=f.getStore?.();
 
-  const store = f.getStore?.();
+ if(!store){
+  log('⚠ Store диагноза не найден');
+  return false;
+ }
 
-  if(!store){
-    log('⚠ Store диагноза не найден');
-    return false;
-  }
+ const records=store.getRange();
 
-  const records = store.getRange();
+ const target=records.find(r=>
+  String(r.get('ID'))==='5'
+ );
 
-  const target = records.find(r =>
-    String(r.get('ID')) === '5'
-  );
+ if(!target){
+  log('⚠ В Store не найден ID=5 (Заключительный)');
+  return false;
+ }
 
-  if(!target){
-    log('⚠ В Store не найден ID=5 (Заключительный)');
-    return false;
-  }
+ f.setValue(target.get('ID'));
 
-  f.setValue(target.get('ID'));
+ try{
+  f.fireEvent('change',f,target.get('ID'),null);
+ }catch(e){}
 
-  try{
-    f.fireEvent(
-      'change',
-      f,
-      target.get('ID'),
-      null
-    );
-  }catch(e){}
+ await sleep(300);
 
-  await sleep(300);
+ log(
+  '✓ Диагноз:',
+  target.get('DisplayName'),
+  'ID='+target.get('ID')
+ );
 
-  log(
-    '✓ Диагноз:',
-    target.get('DisplayName'),
-    'ID=' + target.get('ID')
-  );
-
-  return (
-    String(f.getValue()) === '5'
-  );
+ return String(f.getValue())==='5';
 }
 
-
-
 function fillDiagType(w){
-
  const f=
   field(w,'DiagTypeId')||
   byLabel(w,'Тип');
 
- if(
-  f&&select(
-   f,
-   C.diagType
-  )
- ){
-
-  log(
-   '✓ Тип: Основное'
-  );
-
+ if(f&&select(f,C.diagType)){
+  log('✓ Тип: Основное');
  }
-
 }
 
-
 function fillCharacter(w){
-
  const f=
   field(w,'CharSickId')||
   byLabel(w,'Характер');
 
- if(
-  f&&select(
-   f,
-   C.charSick
-  )
- ){
-
-  log(
-   '✓ Характер заболевания'
-  );
-
+ if(f&&select(f,C.charSick)){
+  log('✓ Характер заболевания');
  }
-
 }
-
-
-// =========================================================
-// ИСТОЧНИК ФИНАНСИРОВАНИЯ — ВТОРОЕ ОКНО
-// =========================================================
 
 async function fillPatientFinance(w){
+ const f=
+   field(w,'FinanceSourceID')||
+   byLabel(w,'Источник фин.');
 
-  const f =
-    field(w,'FinanceSourceID') ||
-    byLabel(w,'Источник фин.');
+ if(!f){
+  log('⚠ Второе окно: источник финансирования не найден');
+  return false;
+ }
 
-  if(!f){
-    log('⚠ Второе окно: источник финансирования не найден');
-    return false;
-  }
+ const root=w.getEl?.()?.dom;
 
-  // 1. Нажимаем зелёную кнопку «Определить источник»
-  const root = w.getEl?.()?.dom;
+ if(root){
+  const refresh=
+    root.querySelector('a.image-button-refresh_32')||
+    [...root.querySelectorAll('a')].find(a=>
+      [...a.classList].some(
+        c=>c.includes('image-button-refresh')
+      )
+    );
 
-  if(root){
-
-    const refresh =
-      root.querySelector('a.image-button-refresh_32') ||
-      [...root.querySelectorAll('a')].find(a =>
-        [...a.classList].some(
-          c => c.includes('image-button-refresh')
-        )
-      );
-
-    if(refresh){
-      refresh.click();
-      log('→ Определяем источник финансирования');
-    }else{
-      log('⚠ Кнопка «Определить источник» не найдена');
-      return false;
-    }
-
+  if(refresh){
+   refresh.click();
+   log('→ Определяем источник финансирования');
   }else{
-    log('⚠ Не найдено окно приёма');
-    return false;
+   log('⚠ Кнопка «Определить источник» не найдена');
+   return false;
   }
+ }else{
+  log('⚠ Не найдено окно приёма');
+  return false;
+ }
 
-  await sleep(500);
+ await sleep(500);
 
-  // 2. Открываем список «Источник фин.»
-  try{
-    if(typeof f.expand === 'function'){
-      f.expand();
-    }else{
-      f.getEl?.()?.dom?.click();
-    }
-  }catch(e){
-    log('⚠ Не удалось открыть источник финансирования');
-    return false;
+ try{
+  if(typeof f.expand==='function'){
+   f.expand();
+  }else{
+   f.getEl?.()?.dom?.click();
   }
+ }catch(e){
+  log('⚠ Не удалось открыть источник финансирования');
+  return false;
+ }
 
-  await sleep(200);
+ await sleep(200);
 
-  // 3. Ищем нужный вариант
-  const targetText =
-    'Услуги, оплачиваемые в рамках комплексного тарифа';
+ const targetText=
+  'Услуги, оплачиваемые в рамках комплексного тарифа';
 
-  const items = [
-    ...document.querySelectorAll('li.x-boundlist-item')
-  ];
+ const items=[
+  ...document.querySelectorAll('li.x-boundlist-item')
+ ];
 
-  const target = items.find(el =>
-    el.textContent
-      .replace(/\s+/g,' ')
-      .trim()
-      .includes(targetText)
-  );
+ const target=items.find(el=>
+  el.textContent
+   .replace(/\s+/g,' ')
+   .trim()
+   .includes(targetText)
+ );
 
-  if(!target){
-    log('⚠ Не найден вариант: ' + targetText);
-    return false;
-  }
+ if(!target){
+  log('⚠ Не найден вариант: '+targetText);
+  return false;
+ }
 
-  // 4. Выбираем его
-  target.click();
+ target.click();
+ await sleep(400);
 
-  await sleep(400);
+ log(
+  '✓ Источник финансирования: '+
+  (f.getRawValue?.()||'')
+ );
 
-  log(
-    '✓ Источник финансирования: ' +
-    (f.getRawValue?.() || '')
-  );
-
-  return true;
+ return true;
 }
 
-
-// =========================================================
-// ДИАГНОЗ
-// =========================================================
-
 async function fillDiagnosis(w){
-
- const code=field(
-  w,
-  'code'
- );
+ const code=field(w,'code');
 
  const name=
   field(w,'diagName')||
   field(w,'SearchSickDF');
 
- const sick=field(
-  w,
-  'SickID'
- );
-
-
- // Код
+ const sick=field(w,'SickID');
 
  if(code){
-
-  code.setValue(
-   cfg().diagnosisCode
-  );
+  code.setValue(cfg().diagnosisCode);
 
   try{
-
-   code.fireEvent(
-    'change',
-    code,
-    cfg().diagnosisCode,
-    null
-   );
-
+   code.fireEvent('change',code,cfg().diagnosisCode,null);
   }catch(e){}
 
   try{
-
-   code.fireEvent(
-    'blur',
-    code
-   );
-
+   code.fireEvent('blur',code);
   }catch(e){}
 
-  log(
-   '✓ Код:',
-   cfg().diagnosisCode
-  );
-
+  log('✓ Код:',cfg().diagnosisCode);
  }
-
 
  await sleep(300);
 
-
- // Наименование
-
  if(name){
-
   try{
-
    name.setValue(
     cfg().diagnosisName,
     cfg().diagnosisName
    );
-
   }catch(e){
-
    try{
-
-    name.setValue(
-     cfg().diagnosisName
-    );
-
+    name.setValue(cfg().diagnosisName);
    }catch(x){}
-
   }
 
-
   try{
-
    name.fireEvent(
     'change',
     name,
     cfg().diagnosisName,
     null
    );
-
   }catch(e){}
-
 
   try{
-
-   name.fireEvent(
-    'blur',
-    name
-   );
-
+   name.fireEvent('blur',name);
   }catch(e){}
 
-
-  log(
-   '✓ Наименование:',
-   cfg().diagnosisName
-  );
-
+  log('✓ Наименование:',cfg().diagnosisName);
  }
 
-
- // SickID
-
  if(sick){
-
-  sick.setValue(
-   cfg().sickId
-  );
+  sick.setValue(cfg().sickId);
 
   try{
-
    sick.fireEvent(
     'change',
     sick,
     cfg().sickId,
     null
    );
-
   }catch(e){}
 
-
-  log(
-   '✓ SickID:',
-   cfg().sickId
-  );
-
+  log('✓ SickID:',cfg().sickId);
  }
 
-
  await sleep(300);
-
 }
 
-
-// =========================================================
-// ПРОВЕРКА СОХРАНЕНИЯ
-// =========================================================
-
 function checkSave(w){
-
  const p=w.down('#frm');
  const b=w.down('#btnSave');
 
  if(!p||!b)return;
 
-
  const form=p.getForm();
-
  form.isValid();
 
-
  if(!b.disabled){
-
-  log(
-   '✓ Сохранить активна'
-  );
-
+  log('✓ Сохранить активна');
   return;
-
  }
-
 
  const bad=[];
 
+ form.getFields().each(f=>{
+  if(f.disabled||f.hidden)return;
 
- form.getFields().each(
-  f=>{
+  let ok=true;
 
-   if(
-    f.disabled||
-    f.hidden
-   )return;
+  try{
+   ok=f.isValid();
+  }catch(e){}
 
-
-   let ok=true;
-
-   try{
-    ok=f.isValid();
-   }catch(e){}
-
-
-   if(!ok){
-
-    bad.push(
-     f.fieldLabel||
-     f.name||
-     f.itemId||
-     'поле'
-    );
-
-   }
-
+  if(!ok){
+   bad.push(
+    f.fieldLabel||
+    f.name||
+    f.itemId||
+    'поле'
+   );
   }
- );
-
+ });
 
  log(
   bad.length
    ? '⚠ Форма невалидна: '+bad.join(', ')
    : '⚠ Сохранить пока не активна'
  );
-
 }
 
-
-// =========================================================
-// ЗАПОЛНЕНИЕ ВТОРОГО ОКНА
-// =========================================================
-
 async function fillPatient(w){
-
- log(
-  '→ Заполняем приём'
- );
-
+ log('→ Заполняем приём');
 
  await fillDiagnosisType(w);
-
  await sleep(200);
-
  await fillDiagnosis(w);
-
  fillDiagType(w);
-
  await sleep(200);
-
  fillCharacter(w);
-
  await sleep(300);
-
  await fillPatientFinance(w);
-
  await sleep(300);
-
  checkSave(w);
 
- log(
-  '✓ Приём заполнен'
- );
-
+ log('✓ Приём заполнен');
 }
 
 function hideRecommendationPopup(){
+ const elements=document.querySelectorAll('[role="dialog"]');
 
-    const elements = document.querySelectorAll('[role="dialog"]');
+ elements.forEach(el=>{
+  const text=(el.textContent||'')
+   .replace(/\s+/g,' ')
+   .trim();
 
-    elements.forEach(el => {
-
-        const text = (el.textContent || '')
-            .replace(/\s+/g, ' ')
-            .trim();
-
-        if (
-            text.includes('Вы можете выделить текст рекомендации') &&
-            text.includes('Добавить как рекомендацию по лечению')
-        ) {
-            el.style.setProperty('display', 'none', 'important');
-        }
-
-    });
-
+  if(
+   text.includes('Вы можете выделить текст рекомендации')&&
+   text.includes('Добавить как рекомендацию по лечению')
+  ){
+   el.style.setProperty('display','none','important');
+  }
+ });
 }
-// =========================================================
-// ОСНОВНАЯ ЛОГИКА
-// =========================================================
 
 async function autoFill(mode='psy'){
-
  MODE=mode;
 
- if(
-  window.__DAMUMED_RUNNING
- )return;
+ if(window.__DAMUMED_RUNNING)return;
 
  window.__DAMUMED_RUNNING=true;
 
  try{
-
   const b=booking();
 
   if(b){
-
    await fillBooking(b);
-
   }else{
-
-   log(
-    '⚠ Окно «Запись на прием» не найдено'
-   );
-
+   log('⚠ Окно «Запись на прием» не найдено');
   }
 
   let p=null;
 
-  for(
-   let i=0;
-   i<60;
-   i++
-  ){
-
+  for(let i=0;i<60;i++){
    p=patient();
-
    if(p)break;
-
    await sleep(300);
-
   }
 
   if(p){
-
    await fillPatient(p);
-
   }else{
-
-   log(
-    '⚠ Второе окно приёма не найдено'
-   );
-
+   log('⚠ Второе окно приёма не найдено');
   }
-
  }catch(e){
-
-  console.error(
-   '[Damumed Автозаполнение] ❌',
-   e
-  );
-
+  console.error('[Damumed Автозаполнение] ❌',e);
  }finally{
-
   window.__DAMUMED_RUNNING=false;
-
  }
-
 }
-
-
-// =========================================================
-// КНОПКА ПСИХИАТРИЯ
-// =========================================================
 
 function createButton(){
+ if(document.getElementById('damumed-auto-fill-btn'))return;
 
- if(
-  document.getElementById(
-   'damumed-auto-fill-btn'
-  )
- )return;
+ const b=document.createElement('button');
 
- const b=document.createElement(
-  'button'
- );
-
- b.id=
-  'damumed-auto-fill-btn';
-
+ b.id='damumed-auto-fill-btn';
  b.type='button';
+ b.textContent='⚡ Автозаполнение';
+ b.title='Автоматически заполнить приём';
 
- b.textContent=
-  '⚡ Автозаполнение';
-
- b.title=
-  'Автоматически заполнить приём';
-
- Object.assign(
-  b.style,
-  {
-
-   position:'fixed',
-
-   zIndex:'2147483647',
-
-   width:'170px',
-
-   height:'36px',
-
-   padding:'0 10px',
-
-   font:'14px Arial',
-
-   border:'1px solid #8aaa5a',
-
-   borderRadius:'6px',
-
-   background:'#dcebc1',
-
-   color:'#3d5422',
-
-   cursor:'pointer',
-
-   textAlign:'center',
-
-   boxSizing:'border-box',
-
-   display:'none'
-
-  }
- );
+ Object.assign(b.style,{
+  position:'fixed',
+  zIndex:'2147483647',
+  width:'170px',
+  height:'36px',
+  padding:'0 10px',
+  font:'14px Arial',
+  border:'1px solid #8aaa5a',
+  borderRadius:'6px',
+  background:'#dcebc1',
+  color:'#3d5422',
+  cursor:'pointer',
+  textAlign:'center',
+  boxSizing:'border-box',
+  display:'none'
+ });
 
  b.onclick=async()=>{
-
-  if(
-   window.__DAMUMED_RUNNING
-  )return;
+  if(window.__DAMUMED_RUNNING)return;
 
   b.disabled=true;
-
-  b.textContent=
-   '⚡ Заполняем...';
+  b.textContent='⚡ Заполняем...';
 
   try{
-
    await autoFill('psy');
-
   }finally{
-
    b.disabled=false;
-
-   b.textContent=
-    '⚡ Автозаполнение';
-
+   b.textContent='⚡ Автозаполнение';
   }
-
  };
 
  document.body.appendChild(b);
-
- log(
-  '✓ Кнопка создана'
- );
-
+ log('✓ Кнопка создана');
 }
-
-
-// =========================================================
-// КНОПКА НАРКОЛОГ
-// =========================================================
 
 function createNarcButton(){
+ if(document.getElementById('damumed-narc-fill-btn'))return;
 
- if(
-  document.getElementById(
-   'damumed-narc-fill-btn'
-  )
- )return;
+ const b=document.createElement('button');
 
- const b=document.createElement(
-  'button'
- );
-
- b.id=
-  'damumed-narc-fill-btn';
-
+ b.id='damumed-narc-fill-btn';
  b.type='button';
+ b.textContent='⚡ Нарколог';
+ b.title='Автозаполнение наркологического приёма';
 
- b.textContent=
-  '⚡ Нарколог';
-
- b.title=
-  'Автозаполнение наркологического приёма';
-
- Object.assign(
-  b.style,
-  {
-
-   position:'fixed',
-
-   zIndex:'2147483647',
-
-   width:'150px',
-
-   height:'36px',
-
-   padding:'0 10px',
-
-   font:'14px Arial',
-
-   border:'1px solid #8aaa5a',
-
-   borderRadius:'6px',
-
-   background:'#dcebc1',
-
-   color:'#3d5422',
-
-   cursor:'pointer',
-
-   textAlign:'center',
-
-   boxSizing:'border-box',
-
-   display:'none'
-
-  }
- );
+ Object.assign(b.style,{
+  position:'fixed',
+  zIndex:'2147483647',
+  width:'150px',
+  height:'36px',
+  padding:'0 10px',
+  font:'14px Arial',
+  border:'1px solid #8aaa5a',
+  borderRadius:'6px',
+  background:'#dcebc1',
+  color:'#3d5422',
+  cursor:'pointer',
+  textAlign:'center',
+  boxSizing:'border-box',
+  display:'none'
+ });
 
  b.onclick=async()=>{
-
-  if(
-   window.__DAMUMED_RUNNING
-  )return;
+  if(window.__DAMUMED_RUNNING)return;
 
   b.disabled=true;
-
-  b.textContent=
-   '⚡ Заполняем...';
+  b.textContent='⚡ Заполняем...';
 
   try{
-
    await autoFill('narc');
-
   }finally{
-
    b.disabled=false;
-
-   b.textContent=
-    '⚡ Нарколог';
-
+   b.textContent='⚡ Нарколог';
    MODE='psy';
-
   }
-
  };
 
  document.body.appendChild(b);
-
- log(
-  '✓ Кнопка «Нарколог» создана'
- );
-
+ log('✓ Кнопка «Нарколог» создана');
 }
-
-
-// =========================================================
-// ПОЗИЦИЯ ПСИХИАТРИЧЕСКОЙ КНОПКИ
-// =========================================================
 
 function positionButton(){
-
- const b=
-  document.getElementById(
-   'damumed-auto-fill-btn'
-  );
-
+ const b=document.getElementById('damumed-auto-fill-btn');
  if(!b)return;
 
  const w=booking();
 
  if(!w){
-
   b.style.display='none';
-
   return;
-
  }
 
- let save=
-  w.down('#btnSave');
+ let save=w.down('#btnSave');
 
  if(!save){
-
-  save=w.query(
-   'button'
-  ).find(
-   x=>
-    String(
-     x.text||''
-    )
+  save=w.query('button').find(
+   x=>String(x.text||'')
     .toLowerCase()
     .includes('сохран')
   );
-
  }
 
- if(
-  !save?.getEl?.()?.dom
- ){
-
+ if(!save?.getEl?.()?.dom){
   b.style.display='none';
-
   return;
-
  }
 
- const r=
-  save
-   .getEl()
-   .dom
-   .getBoundingClientRect();
+ const r=save.getEl().dom.getBoundingClientRect();
 
  b.style.display='block';
-
- b.style.left=
-  Math.max(
-   5,
-   r.left-180
-  )+'px';
-
- b.style.top=
-  Math.max(
-   5,
-   r.top
-  )+'px';
-
+ b.style.left=Math.max(5,r.left-180)+'px';
+ b.style.top=Math.max(5,r.top)+'px';
 }
-
-
-// =========================================================
-// ПОЗИЦИЯ НАРКОЛОГИЧЕСКОЙ КНОПКИ
-// =========================================================
 
 function positionNarcButton(){
-
- const b=
-  document.getElementById(
-   'damumed-narc-fill-btn'
-  );
-
+ const b=document.getElementById('damumed-narc-fill-btn');
  if(!b)return;
 
  const w=booking();
 
  if(!w){
-
   b.style.display='none';
-
   return;
-
  }
 
- let save=
-  w.down('#btnSave');
+ let save=w.down('#btnSave');
 
  if(!save){
-
-  save=w.query(
-   'button'
-  ).find(
-   x=>
-    String(
-     x.text||''
-    )
+  save=w.query('button').find(
+   x=>String(x.text||'')
     .toLowerCase()
     .includes('сохран')
   );
-
  }
 
- if(
-  !save?.getEl?.()?.dom
- ){
-
+ if(!save?.getEl?.()?.dom){
   b.style.display='none';
-
   return;
-
  }
 
- const r=
-  save
-   .getEl()
-   .dom
-   .getBoundingClientRect();
+ const r=save.getEl().dom.getBoundingClientRect();
 
  b.style.display='block';
-
- b.style.left=
-  Math.max(
-   5,
-   r.left-335
-  )+'px';
-
- b.style.top=
-  Math.max(
-   5,
-   r.top
-  )+'px';
-
+ b.style.left=Math.max(5,r.left-335)+'px';
+ b.style.top=Math.max(5,r.top)+'px';
 }
-
-
-// =========================================================
-// ЗАПУСК
-// =========================================================
 
 function start(){
-
  createButton();
-
  createNarcButton();
 
- setInterval(
-  ()=>{
-   positionButton();
-   positionNarcButton();
-  },
-  500
- );
+ setInterval(()=>{
+  positionButton();
+  positionNarcButton();
+ },500);
 
- new MutationObserver(
-  ()=>{
-   positionButton();
-   positionNarcButton();
-  }
- ).observe(
-  document.body,
-  {
-   childList:true,
-   subtree:true
-  }
- );
+ new MutationObserver(()=>{
+  positionButton();
+  positionNarcButton();
+ }).observe(document.body,{
+  childList:true,
+  subtree:true
+ });
 
  positionButton();
-
  positionNarcButton();
 
- log(
-  '✓ CLEAN FIX 7.0 запущен'
- );
-
+ log('✓ CLEAN FIX 7.0 запущен');
 }
 
+const timer=setInterval(()=>{
+ if(typeof Ext!=='undefined'&&Ext.ComponentQuery){
+  clearInterval(timer);
+  start();
+ }
+},500);
 
-const timer=setInterval(
- ()=>{
+new MutationObserver(mutations=>{
+ mutations.forEach(mutation=>{
+  mutation.addedNodes.forEach(node=>{
+   if(node.nodeType!==1)return;
 
-  if(
-   typeof Ext!=='undefined'&&
-   Ext.ComponentQuery
-  ){
-
-   clearInterval(timer);
-
-   start();
-
-  }
-
- },
- 500
-);
-
-
-// Точечно скрываем только popup Alima при его добавлении.
-// Не запускаем постоянный скан всей страницы.
-new MutationObserver(mutations => {
- mutations.forEach(mutation => {
-  mutation.addedNodes.forEach(node => {
-   if(node.nodeType !== 1)return;
-
-   const elements = [];
+   const elements=[];
 
    if(
     node.matches?.(
@@ -1443,26 +857,23 @@ new MutationObserver(mutations => {
     );
    }
 
-   elements.forEach(el => {
-    const text = (el.textContent || '')
-     .replace(/\s+/g, ' ')
+   elements.forEach(el=>{
+    const text=(el.textContent||'')
+     .replace(/\s+/g,' ')
      .trim();
 
     if(
-     text.includes('Вы можете выделить текст рекомендации') &&
+     text.includes('Вы можете выделить текст рекомендации')&&
      text.includes('Добавить как рекомендацию по лечению')
     ){
-     el.style.setProperty('display', 'none', 'important');
+     el.style.setProperty('display','none','important');
     }
    });
   });
  });
-}).observe(
- document.body,
- {
-  childList:true,
-  subtree:true
- }
-);
+}).observe(document.body,{
+ childList:true,
+ subtree:true
+});
 
 })();
