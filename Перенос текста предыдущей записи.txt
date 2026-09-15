@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Damumed — Перенос текста предыдущей записи AUTO
 // @namespace    damumed-transfer-previous-record
-// @version      1.6
+// @version      2.1
 // @description  Автоматически загружает дерево записей и переносит текст последнего предыдущего приёма
 // @match        https://doc-ast.dmed.kz/MedicalRecords*
 // @grant        none
@@ -12,6 +12,7 @@
     'use strict';
 
     const PREFIX = '[Перенос записи]';
+    let transferInProgress = false;
 
     function log(...args) {
         console.log(PREFIX, ...args);
@@ -19,6 +20,82 @@
 
     function sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function getSameOriginWindows() {
+        const result = [window];
+
+        document.querySelectorAll('iframe').forEach(iframe => {
+            try {
+                const frameWindow = iframe.contentWindow;
+                if (frameWindow && frameWindow.document && !result.includes(frameWindow)) {
+                    result.push(frameWindow);
+                }
+            } catch (e) {
+                // Чужие по origin фреймы намеренно пропускаем.
+            }
+        });
+
+        return result;
+    }
+
+    function showStatus(message, isError) {
+        let status = document.getElementById('damumed-transfer-status');
+
+        if (!status) {
+            status = document.createElement('div');
+            status.id = 'damumed-transfer-status';
+            status.style.cssText = [
+                'position:fixed', 'right:20px', 'bottom:72px',
+                'z-index:2147483647', 'max-width:300px',
+                'padding:6px 9px', 'border-radius:5px',
+                'color:#fff', 'font:11px Arial,sans-serif',
+                'box-shadow:0 2px 8px rgba(0,0,0,.25)'
+            ].join(';');
+            document.body.appendChild(status);
+        }
+
+        status.textContent = message;
+        status.style.background = isError ? '#b42318' : '#287a3e';
+        status.style.display = 'block';
+
+        clearTimeout(showStatus.timer);
+        showStatus.timer = setTimeout(() => {
+            status.style.display = 'none';
+        }, isError ? 8000 : 3500);
+    }
+
+    async function reopenCurrentRecord(currentId) {
+        await sleep(700);
+
+        for (const context of getSameOriginWindows()) {
+            try {
+                if (typeof context.loadMedicalRecord === 'function') {
+                    log('→ Повторно открываем текущую запись:', currentId);
+                    context.loadMedicalRecord(String(currentId), '25');
+                    await sleep(800);
+                    log('✓ Текущая запись открыта повторно');
+                    return;
+                }
+            } catch (e) {
+                log('⚠ Ошибка вызова loadMedicalRecord:', e);
+            }
+        }
+
+        const currentNode = document.querySelector(
+            '#MedRecordsTreeView li.file[data-id="' +
+            CSS.escape(String(currentId)) + '"]'
+        );
+        const clickable = currentNode && currentNode.querySelector('.k-in, a, span');
+
+        if (clickable) {
+            log('→ Открываем текущую запись кликом по дереву:', currentId);
+            clickable.click();
+            await sleep(800);
+            return;
+        }
+
+        throw new Error('Не удалось повторно открыть текущую запись ' + currentId);
     }
 
 
@@ -81,15 +158,15 @@
         }
 
         try {
-
-            if (
-                typeof TINY !== 'undefined' &&
-                TINY.editors &&
-                TINY.editors['editor_' + id]
-            ) {
-                return TINY.editors['editor_' + id];
+            for (const context of getSameOriginWindows()) {
+                const tiny = context.TINY;
+                if (tiny && tiny.editors && tiny.editors['editor_' + id]) {
+                    return {
+                        editor: tiny.editors['editor_' + id],
+                        context: context
+                    };
+                }
             }
-
         } catch (e) {
 
             log(
@@ -1508,29 +1585,32 @@ async function insertIntoCurrentEditor(
         'editor_' + currentId
     );
 
-    let editor = null;
+    let editorInfo = null;
 
     for (let i = 0; i < 40; i++) {
 
-        editor =
+        editorInfo =
             getCurrentTinyEditor(
                 currentId
             );
 
-        if (editor) {
+        if (editorInfo) {
             break;
         }
 
         await sleep(250);
     }
 
-    if (!editor) {
+    if (!editorInfo) {
 
         throw new Error(
             'Текущий TinyEditor не найден: editor_' +
             currentId
         );
     }
+
+    const editor = editorInfo.editor;
+    const editorContext = editorInfo.context;
 
     log(
         '✓ Текущий TinyEditor найден:',
@@ -1616,7 +1696,7 @@ async function insertIntoCurrentEditor(
         );
 
         editor.t.dispatchEvent(
-            new Event(
+            new editorContext.Event(
                 'input',
                 {
                     bubbles: true
@@ -1625,7 +1705,7 @@ async function insertIntoCurrentEditor(
         );
 
         editor.t.dispatchEvent(
-            new Event(
+            new editorContext.Event(
                 'change',
                 {
                     bubbles: true
@@ -1652,8 +1732,8 @@ async function insertIntoCurrentEditor(
 
 try {
 
-    const medicalRecord =
-        MedicalRecords['md_' + currentId];
+    const recordsRegistry = editorContext.MedicalRecords || window.MedicalRecords;
+    const medicalRecord = recordsRegistry && recordsRegistry['md_' + currentId];
 
     if (!medicalRecord) {
 
@@ -1667,26 +1747,16 @@ try {
         '→ Запускаем штатное сохранение текущей записи'
     );
 
-    await medicalRecord.saveMedicalRecordDocumentText();
+    const saveResult = medicalRecord.saveMedicalRecordDocumentText();
+    if (saveResult && typeof saveResult.then === 'function') {
+        await saveResult;
+    }
 
     log(
         '✓ Штатное сохранение текущей записи завершено'
     );
-await sleep(500);
 
-const currentRecord = document.querySelector(
-    '[onclick="loadMedicalRecord(\'' + currentId + '\',\'25\')"]'
-);
-
-if (currentRecord) {
-    log('→ Повторно открываем текущую запись через дерево:', currentId);
-
-    currentRecord.click();
-
-    await sleep(700);
-
-    log('✓ Текущая запись снова открыта через дерево');
-}
+    await reopenCurrentRecord(currentId);
 } catch (e) {
 
     log(
@@ -1812,13 +1882,9 @@ async function prepareDateRangeForPreviousRecord(currentId) {
         beginPicker.value(beginDate);
         endPicker.value(endDate);
 
-        // Сообщаем DMED, что значения реально изменились.
-        beginPicker.trigger('change');
+        // Одно изменение достаточно для обновления диапазона.
+        // Четыре события подряд в старой версии запускали несколько AJAX-обновлений.
         endPicker.trigger('change');
-
-        // Дополнительно уведомляем обычные DOM-события.
-        jQuery(beginInput).trigger('change');
-        jQuery(endInput).trigger('change');
 
     } catch (e) {
 
@@ -1878,6 +1944,18 @@ async function prepareDateRangeForPreviousRecord(currentId) {
     // =========================================================
 
     async function transferPreviousRecord() {
+
+        if (transferInProgress) {
+            log('Перенос уже выполняется…');
+            return;
+        }
+
+        transferInProgress = true;
+        const button = document.getElementById('damumed-transfer-previous-record');
+        if (button) {
+            button.disabled = true;
+            button.textContent = 'Переносим…';
+        }
 
         try {
 
@@ -1939,39 +2017,6 @@ const pair =
             );
 
 
-            const confirmed =
-                window.confirm(
-
-                    'Перенести текст предыдущей записи?\n\n' +
-
-                    'Предыдущая запись:\n' +
-
-                    pair.previous.date.toLocaleString(
-                        'ru-RU'
-                    ) +
-
-                    '\n\n' +
-
-                    pair.previous.text +
-
-                    '\n\n' +
-
-                    'Текущая запись ID: ' +
-
-                    currentId
-                );
-
-
-            if (!confirmed) {
-
-                log(
-                    'Отменено пользователем'
-                );
-
-                return;
-            }
-
-
             const previousHtml =
                 await fetchPreviousRecordHtml(
                     pair.previous.id
@@ -1990,9 +2035,7 @@ const pair =
             );
 
 
-           alert(
-    '✓ Текст предыдущей записи перенесён и сохранён.'
-);
+            log('✓ Предыдущая запись перенесена, сохранена и снова открыта.');
 
 
         } catch (error) {
@@ -2002,10 +2045,13 @@ const pair =
                 error
             );
 
-            alert(
-                'Не удалось перенести запись.\n\n' +
-                error.message
-            );
+            showStatus('Ошибка переноса: ' + error.message, true);
+        } finally {
+            transferInProgress = false;
+            if (button) {
+                button.disabled = false;
+                button.textContent = 'Перенести последнюю запись';
+            }
         }
     }
 
@@ -2101,7 +2147,7 @@ const pair =
         createButton();
 
         log(
-            '✓ Версия 1.6 запущена'
+            '✓ Версия 2.1 запущена'
         );
     }
 
