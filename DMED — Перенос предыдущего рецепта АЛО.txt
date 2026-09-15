@@ -1,2229 +1,1340 @@
 // ==UserScript==
-// @name         Damumed — Перенос текста предыдущей записи AUTO
-// @namespace    damumed-transfer-previous-record
-// @version      2.2
-// @description  Автоматически загружает дерево записей и переносит текст последнего предыдущего приёма
-// @match        https://doc-ast.dmed.kz/MedicalRecords*
+// @name         DMED — Перенос предыдущего рецепта АЛО
+// @namespace    dmed-prescription-helper
+// @version      1.6
+// @description  Перенос параметров предыдущего рецепта в новый рецепт АЛО
+// @match        https://doc-ast.dmed.kz/*
 // @grant        none
-// @run-at       document-idle
 // ==/UserScript==
 
 (function () {
     'use strict';
 
-    const PREFIX = '[Перенос записи]';
-    let transferInProgress = false;
+    const STORAGE_KEY = 'dmed_previous_alo_recipe';
+
+    // ------------------------------------------------------------
+    // Утилиты
+    // ------------------------------------------------------------
 
     function log(...args) {
-        console.log(PREFIX, ...args);
+        console.log('[DMED RX]', ...args);
     }
 
-    function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+    function getGridFromRow(row) {
+        return $(row).closest('.k-grid').data('kendoGrid');
     }
 
-    function getSameOriginWindows() {
-        const result = [window];
+    function getRecipesFromCurrentPage() {
+        const rows = [...document.querySelectorAll('tr')];
 
-        document.querySelectorAll('iframe').forEach(iframe => {
-            try {
-                const frameWindow = iframe.contentWindow;
-                if (frameWindow && frameWindow.document && !result.includes(frameWindow)) {
-                    result.push(frameWindow);
-                }
-            } catch (e) {
-                // Чужие по origin фреймы намеренно пропускаем.
-            }
-        });
-
-        return result;
-    }
-
-    function showStatus(message, isError) {
-        let status = document.getElementById('damumed-transfer-status');
-
-        if (!status) {
-            status = document.createElement('div');
-            status.id = 'damumed-transfer-status';
-            status.style.cssText = [
-                'position:fixed', 'right:20px', 'bottom:72px',
-                'z-index:2147483647', 'max-width:300px',
-                'padding:6px 9px', 'border-radius:5px',
-                'color:#fff', 'font:11px Arial,sans-serif',
-                'box-shadow:0 2px 8px rgba(0,0,0,.25)'
-            ].join(';');
-            document.body.appendChild(status);
-        }
-
-        status.textContent = message;
-        status.style.background = isError ? '#b42318' : '#287a3e';
-        status.style.display = 'block';
-
-        clearTimeout(showStatus.timer);
-        showStatus.timer = setTimeout(() => {
-            status.style.display = 'none';
-        }, isError ? 8000 : 3500);
-    }
-
-    function enableFastDmedNotifications() {
-        const scheduled = new WeakSet();
-        const wantedTexts = [
-            'данные успешно сохранены',
-            'напоминаем вам о необходимости заполнить заключение'
-        ];
-
-        const scan = root => {
-            root.querySelectorAll('.alert, [role="alert"]').forEach(notification => {
-                const text = String(notification.textContent || '')
-                    .replace(/\s+/g, ' ')
-                    .trim()
-                    .toLowerCase();
-
-                if (
-                    scheduled.has(notification) ||
-                    !wantedTexts.some(fragment => text.includes(fragment))
-                ) {
-                    return;
-                }
-
-                scheduled.add(notification);
-                setTimeout(() => {
-                    if (!notification.isConnected) {
-                        return;
-                    }
-
-                    const close = notification.querySelector(
-                        '[data-dismiss="alert"], button.close, .close'
-                    );
-
-                    if (close) {
-                        close.click();
-                    } else {
-                        notification.remove();
-                    }
-                }, 2000);
-            });
-        };
-
-        const observeDocument = doc => {
-            scan(doc);
-            new MutationObserver(() => scan(doc)).observe(doc.documentElement, {
-                childList: true,
-                subtree: true
-            });
-        };
-
-        for (const context of getSameOriginWindows()) {
-            try {
-                observeDocument(context.document);
-            } catch (e) {
-                log('⚠ Не удалось включить быстрое закрытие уведомлений:', e);
-            }
-        }
-    }
-
-    async function reopenCurrentRecord(currentId) {
-        await sleep(700);
-
-        for (const context of getSameOriginWindows()) {
-            try {
-                if (typeof context.loadMedicalRecord === 'function') {
-                    log('→ Повторно открываем текущую запись:', currentId);
-                    context.loadMedicalRecord(String(currentId), '25');
-                    await sleep(800);
-                    log('✓ Текущая запись открыта повторно');
-                    return;
-                }
-            } catch (e) {
-                log('⚠ Ошибка вызова loadMedicalRecord:', e);
-            }
-        }
-
-        const currentNode = document.querySelector(
-            '#MedRecordsTreeView li.file[data-id="' +
-            CSS.escape(String(currentId)) + '"]'
-        );
-        const clickable = currentNode && currentNode.querySelector('.k-in, a, span');
-
-        if (clickable) {
-            log('→ Открываем текущую запись кликом по дереву:', currentId);
-            clickable.click();
-            await sleep(800);
-            return;
-        }
-
-        throw new Error('Не удалось повторно открыть текущую запись ' + currentId);
-    }
-
-
-    // =========================================================
-    // ТЕКУЩАЯ МЕДИЦИНСКАЯ ЗАПИСЬ
-    // =========================================================
-
-    function getCurrentMedRecordId() {
-
-        try {
-            const link = document.querySelector(
-                '#MedRecEditorTabLinks > li.active > a'
-            );
-
-            if (link) {
-                const id = link.getAttribute('data-medrecid');
-
-                if (id) {
-                    return String(id);
-                }
-            }
-
-        } catch (e) {
-            log(
-                'Ошибка поиска текущей записи:',
-                e
-            );
-        }
-
-
-        // Запасной вариант через iframe
-
-        const iframe = document.querySelector(
-            'iframe[id^="iframeMedRec_"]'
+        const recipeRows = rows.filter(tr =>
+            tr.innerText.includes('Дата выписки рецепта') &&
+            tr.innerText.includes('Rp:')
         );
 
-        if (iframe) {
+        const recipes = [];
+        const seen = new Set();
 
-            const match = iframe.id.match(
-                /^iframeMedRec_(\d+)$/
-            );
+        for (const recipeRow of recipeRows) {
+            const grid = getGridFromRow(recipeRow);
 
-            if (match) {
-                return match[1];
-            }
-        }
-
-        return null;
-    }
-
-
-    // =========================================================
-    // ТЕКУЩИЙ TINYEDITOR
-    // =========================================================
-
-    function getCurrentTinyEditor(id) {
-
-        if (!id) {
-            return null;
-        }
-
-        try {
-            for (const context of getSameOriginWindows()) {
-                const tiny = context.TINY;
-                if (tiny && tiny.editors && tiny.editors['editor_' + id]) {
-                    return {
-                        editor: tiny.editors['editor_' + id],
-                        context: context
-                    };
-                }
-            }
-        } catch (e) {
-
-            log(
-                'Ошибка поиска TINY.editor:',
-                e
-            );
-
-        }
-
-        return null;
-    }
-
-
-    // =========================================================
-    // ДАТА
-    // =========================================================
-
-    function parseRecordDate(text) {
-
-        if (!text) {
-            return null;
-        }
-
-        const match = String(text).match(
-            /(\d{2})\.(\d{2})\.(\d{4})\s+(\d{1,2}):(\d{2})/
-        );
-
-        if (!match) {
-            return null;
-        }
-
-        const day = Number(match[1]);
-        const month = Number(match[2]) - 1;
-        const year = Number(match[3]);
-        const hour = Number(match[4]);
-        const minute = Number(match[5]);
-
-        return new Date(
-            year,
-            month,
-            day,
-            hour,
-            minute,
-            0,
-            0
-        );
-    }
-
-
-    // =========================================================
-    // ПОЛУЧАЕМ KENDO TREEVIEW
-    // =========================================================
-
-    function getTreeView() {
-
-        const treeElement =
-            document.querySelector(
-                '#MedRecordsTreeView'
-            );
-
-        if (!treeElement) {
-            return null;
-        }
-
-        try {
-
-            if (
-                typeof jQuery !== 'undefined' &&
-                jQuery.fn &&
-                jQuery.fn.data
-            ) {
-
-                const tree =
-                    jQuery(treeElement)
-                        .data('kendoTreeView');
-
-                if (tree) {
-                    return tree;
-                }
+            if (!grid) {
+                continue;
             }
 
-        } catch (e) {
-
-            log(
-                'Ошибка получения Kendo TreeView:',
-                e
-            );
-
-        }
-
-        return null;
-    }
-
-
-    // =========================================================
-    // АВТОМАТИЧЕСКИ РАСКРЫВАЕМ РОДИТЕЛЕЙ ТЕКУЩЕЙ ЗАПИСИ
-    // =========================================================
-
-    async function expandCurrentRecordParents(
-        currentId
-    ) {
-
-        const treeElement =
-            document.querySelector(
-                '#MedRecordsTreeView'
-            );
-
-        if (!treeElement) {
-            return;
-        }
-
-        const currentFile =
-            treeElement.querySelector(
-                '.file[data-id="' +
-                CSS.escape(String(currentId)) +
-                '"]'
-            );
-
-        if (!currentFile) {
-
-            log(
-                '⚠ Текущая запись пока отсутствует в дереве'
-            );
-
-            return;
-        }
-
-        let parent = currentFile.parentElement;
-
-        while (parent) {
-
-            if (
-                parent.matches &&
-                parent.matches('li.k-item') &&
-                parent.querySelector('.med-records-loader')
-            ) {
-                break;
-            }
-
-            parent = parent.parentElement;
-        }
-
-        if (!parent) {
-            log('⚠ Не найден родительский период текущей записи');
-            return;
-        }
-
-        const label =
-            String(parent.textContent || '')
-                .replace(/\s+/g, ' ')
-                .trim();
-
-        log(
-            '✓ Родительский период текущей записи:',
-            label
-        );
-
-        // После AJAX DMED может полностью заменить <li> периода.
-        // Поэтому после каждого клика заново ищем период по названию.
-
-        const findLivePeriod = () => {
-
-            const tree =
-                document.querySelector(
-                    '#MedRecordsTreeView'
-                );
-
-            if (!tree) {
-                return null;
-            }
-
-            const periods =
-                Array.from(
-                    tree.querySelectorAll(
-                        'li.k-item:has(.med-records-loader)'
-                    )
-                );
-
-            return periods.find(
-                item =>
-                    String(item.textContent || '')
-                        .replace(/\s+/g, ' ')
-                        .trim() === label
-            ) || null;
-        };
-
-
-        const getRecords = item => {
+            const item = grid.dataItem(recipeRow);
 
             if (!item) {
+                continue;
+            }
+
+            const recipe = item.toJSON
+                ? item.toJSON()
+                : { ...item };
+
+            recipe.__rowText = String(recipeRow.innerText || '');
+
+            const key = String(
+                recipe.ID ||
+                recipe.PrescriptionNumber ||
+                `${recipe.RecipeDate || ''}|${recipe.Rp || ''}`
+            );
+
+            if (seen.has(key)) {
+                continue;
+            }
+
+            seen.add(key);
+            recipes.push(recipe);
+        }
+
+        return recipes;
+    }
+
+    function parseMnnFromRp(rp) {
+        if (!rp) return '';
+
+        // Например:
+        // Оланзапин, 10 мг, Таблетки...
+        return rp
+            .split(',')[0]
+            .trim();
+    }
+
+    function parseDose(recipe) {
+        return String(
+            recipe.Dosage ??
+            ''
+        ).trim();
+    }
+
+    function parseForm(recipe) {
+        return String(
+            recipe.DrugDosageForm ??
+            ''
+        ).trim()
+            .toLowerCase();
+    }
+
+    // ------------------------------------------------------------
+    // Работа с сохранёнными рецептами
+    // ------------------------------------------------------------
+
+    function getStoredRecipes() {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+
+            if (!raw) {
                 return [];
             }
 
-            const group =
-                item.querySelector(
-                    ':scope > .k-group'
-                );
+            const parsed = JSON.parse(raw);
 
-            return group
-                ? Array.from(
-                    group.querySelectorAll(
-                        ':scope > li.file[data-id]'
-                    )
-                )
-                : [];
-        };
+            // Совместимость со старой версией,
+            // где сохранялся только один объект
+            if (Array.isArray(parsed)) {
+                return parsed.map(recipe => {
+                    const tradeName = String(
+                        recipe.tradeName || ''
+                    ).trim().toLowerCase();
 
+                    if (tradeName === 'палиперидон') {
+                        recipe.mnn = 'Палиперидон';
+                    }
 
-        const isExpanded = item => {
+                    if (
+                        tradeName === 'тизерцин' ||
+                        tradeName === 'тизерцин 25 мг'
+                    ) {
+                        recipe.mnn = 'Левомепромазин';
+                    }
 
-            if (!item) {
-                return false;
+                    return recipe;
+                });
             }
 
-            const aria =
-                item.getAttribute(
-                    'aria-expanded'
-                );
+            if (parsed && typeof parsed === 'object') {
+                const recipe = parsed;
 
-            if (aria === 'true') {
-                return true;
-            }
+                const tradeName = String(
+                    recipe.tradeName || ''
+                ).trim().toLowerCase();
 
-            if (aria === 'false') {
-                return false;
-            }
-
-            if (
-                item.classList.contains(
-                    'k-state-expanded'
-                )
-            ) {
-                return true;
-            }
-
-            if (
-                item.classList.contains(
-                    'k-state-collapsed'
-                )
-            ) {
-                return false;
-            }
-
-            const group =
-                item.querySelector(
-                    ':scope > .k-group'
-                );
-
-            return (
-                !!group &&
-                String(
-                    group.style.display || ''
-                )
-                    .toLowerCase() !== 'none'
-            );
-        };
-
-
-        const getClickable = item =>
-            item &&
-            item.querySelector(
-                ':scope > .k-top .k-in, :scope > .k-mid .k-in, :scope > .k-bot .k-in'
-            );
-
-
-        let live =
-            findLivePeriod();
-
-        if (!live) {
-
-            log(
-                '⚠ Период текущей записи исчез из дерева:',
-                label
-            );
-
-            return;
-        }
-
-
-        let records =
-            getRecords(live);
-
-        let expanded =
-            isExpanded(live);
-
-
-        log(
-            '→ Период:',
-            label,
-            '| раскрыт:',
-            expanded,
-            '| записей в DOM:',
-            records.length
-        );
-
-
-        // =========================================================
-        // КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ
-        // =========================================================
-        //
-        // Если период открыт, но в нём только одна запись,
-        // это НЕ означает, что период полностью загружен.
-        //
-        // В нашем случае DMED показывает текущую запись,
-        // а остальные записи появляются только после повторного
-        // закрытия и открытия периода.
-        // =========================================================
-
-        if (
-            expanded &&
-            records.length <= 1
-        ) {
-
-            log(
-                '→ В периоде только текущая запись.'
-            );
-
-            log(
-                '→ Перезапускаем штатную загрузку периода:',
-                label
-            );
-
-
-            // -----------------------------------------------------
-            // 1. Получаем АКТУАЛЬНЫЙ .k-in
-            // -----------------------------------------------------
-
-            let clickable =
-                getClickable(live);
-
-            if (!clickable) {
-
-                log(
-                    '⚠ Не найден .k-in для периода:',
-                    label
-                );
-
-                return;
-            }
-
-
-            // -----------------------------------------------------
-            // 2. Закрываем период
-            // -----------------------------------------------------
-
-            try {
-
-                log(
-                    '→ Закрываем период:',
-                    label
-                );
-
-                clickable.click();
-
-            } catch (e) {
-
-                log(
-                    '⚠ Ошибка закрытия периода:',
-                    e
-                );
-
-                return;
-            }
-
-
-            // -----------------------------------------------------
-            // 3. Ждём реального закрытия
-            //
-            // ВАЖНО:
-            // каждый раз ищем новый DOM-элемент.
-            // Старый parent после AJAX больше не используем.
-            // -----------------------------------------------------
-
-            let collapsed = false;
-
-            for (
-                let attempt = 0;
-                attempt < 40;
-                attempt++
-            ) {
-
-                live =
-                    findLivePeriod();
-
-                if (
-                    live &&
-                    !isExpanded(live)
-                ) {
-
-                    collapsed = true;
-                    break;
+                if (tradeName === 'палиперидон') {
+                    recipe.mnn = 'Палиперидон';
                 }
 
-                await sleep(100);
-            }
-
-
-            if (!collapsed) {
-
-                log(
-                    '⚠ Период не перешёл в свернутое состояние:',
-                    label
-                );
-
-            } else {
-
-                log(
-                    '✓ Период действительно свернулся:',
-                    label
-                );
-
-            }
-
-
-            // -----------------------------------------------------
-            // 4. ЗАНОВО получаем период после закрытия
-            // -----------------------------------------------------
-
-            live =
-                findLivePeriod();
-
-            if (!live) {
-
-                log(
-                    '⚠ После закрытия период не найден:',
-                    label
-                );
-
-                return;
-            }
-
-
-            clickable =
-                getClickable(live);
-
-            if (!clickable) {
-
-                log(
-                    '⚠ После закрытия .k-in не найден:',
-                    label
-                );
-
-                return;
-            }
-
-
-            // -----------------------------------------------------
-            // 5. Снова открываем
-            // -----------------------------------------------------
-
-            log(
-                '→ Снова открываем период штатным кликом:',
-                label
-            );
-
-            try {
-
-                clickable.click();
-
-            } catch (e) {
-
-                log(
-                    '⚠ Ошибка повторного открытия периода:',
-                    e
-                );
-
-                return;
-            }
-
-
-            // -----------------------------------------------------
-            // 6. Ждём появления дополнительных записей
-            //
-            // Здесь мы уже не просто ждём фиксированные 700 мс.
-            // Постоянно заново читаем DOM.
-            // -----------------------------------------------------
-
-            for (
-                let attempt = 0;
-                attempt < 60;
-                attempt++
-            ) {
-
-                live =
-                    findLivePeriod();
-
-                records =
-                    getRecords(live);
-
                 if (
-                    records.length > 1
+                    tradeName === 'тизерцин' ||
+                    tradeName === 'тизерцин 25 мг'
                 ) {
-
-                    log(
-                        '✓ Содержимое периода догружено:',
-                        label,
-                        '| записей:',
-                        records.length
-                    );
-
-                    return;
+                    recipe.mnn = 'Левомепромазин';
                 }
 
-                await sleep(250);
+                return [recipe];
             }
 
-
-            log(
-                '⚠ После повторного открытия дополнительные записи не появились:',
-                label
-            );
-
-            return;
-        }
-
-
-        // =========================================================
-        // ЕСЛИ ПЕРИОД УЖЕ НОРМАЛЬНО ЗАГРУЖЕН
-        // =========================================================
-
-        if (
-            expanded &&
-            records.length > 1
-        ) {
-
-            log(
-                '✓ Текущий период уже загружен и содержит',
-                records.length,
-                'записей'
-            );
-
-            return;
-        }
-
-
-        // =========================================================
-        // ЕСЛИ ПЕРИОД БЫЛ ЗАКРЫТ
-        // =========================================================
-
-        const clickable =
-            getClickable(live);
-
-        if (!clickable) {
-
-            log(
-                '⚠ Не найден элемент для раскрытия текущего периода'
-            );
-
-            return;
-        }
-
-
-        log(
-            '→ Штатно кликаем текущий период'
-        );
-
-        try {
-
-            clickable.click();
-
+            return [];
         } catch (e) {
-
-            log(
-                '⚠ Ошибка клика по текущему периоду:',
-                e
-            );
-
-        }
-
-
-        // Ждём появления содержимого.
-
-        for (
-            let attempt = 0;
-            attempt < 60;
-            attempt++
-        ) {
-
-            live =
-                findLivePeriod();
-
-            records =
-                getRecords(live);
-
-            if (
-                records.length > 0
-            ) {
-                break;
-            }
-
-            await sleep(250);
+            console.error('[DMED RX] Ошибка чтения рецептов:', e);
+            return [];
         }
     }
 
+    function getStoredRecipe() {
+        const recipes = getStoredRecipes();
 
-    // =========================================================
-    // ПОЛУЧАЕМ ЗАПИСИ ИЗ ДЕРЕВА
-    // =========================================================
+        if (!recipes.length) {
+            return null;
+        }
 
-    function getRecordNodes() {
+        return recipes[recipes.length - 1];
+    }
 
-        const tree =
-            document.querySelector(
-                '#MedRecordsTreeView'
-            );
+    function saveRecipe(recipe) {
+        const recipes = getStoredRecipes();
 
-        if (!tree) {
+        const key = [
+            recipe.mnn || '',
+            recipe.dosage || '',
+            recipe.tradeName || ''
+        ]
+            .join('|')
+            .toLowerCase();
 
-            log(
-                'Дерево #MedRecordsTreeView не найдено'
-            );
+        const existingIndex = recipes.findIndex(item => {
+            const itemKey = [
+                item.mnn || '',
+                item.dosage || '',
+                item.tradeName || ''
+            ]
+                .join('|')
+                .toLowerCase();
 
+            return itemKey === key;
+        });
+
+        if (existingIndex >= 0) {
+            recipes[existingIndex] = recipe;
+        } else {
+            recipes.push(recipe);
+        }
+
+        localStorage.setItem(
+            STORAGE_KEY,
+            JSON.stringify(recipes)
+        );
+    }
+
+    function parseRecipeDate(value) {
+        if (value instanceof Date) return value.getTime();
+        if (typeof value === 'number') return value;
+
+        const text = String(value || '').trim();
+        const microsoft = text.match(/\/Date\((\d+)/i);
+        if (microsoft) return Number(microsoft[1]);
+
+        const ru = text.match(
+            /(\d{1,2})\.(\d{1,2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/
+        );
+
+        if (ru) {
+            return new Date(
+                Number(ru[3]), Number(ru[2]) - 1, Number(ru[1]),
+                Number(ru[4] || 0), Number(ru[5] || 0)
+            ).getTime();
+        }
+
+        const parsed = Date.parse(text);
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    function firstPresent(...values) {
+        return values.find(value =>
+            value != null && String(value).trim() !== ''
+        );
+    }
+
+    function extractUseMethod(recipe) {
+        const text = String(recipe.__rowText || '');
+        const ds = String(recipe.Ds ?? recipe.ds ?? '');
+
+        return String(firstPresent(
+            recipe.UseMethodName,
+            recipe.UseMethod?.Name,
+            recipe.UseMethod?.NameRU,
+            recipe.RouteName,
+            text.match(/Способ\s+введения\s*:\s*([^\r\n]+)/i)?.[1],
+            ds.match(/^\s*([^,;]+)/)?.[1]
+        ) || '').trim();
+    }
+
+    function extractDtd(recipe) {
+        const text = String(recipe.__rowText || '');
+
+        return firstPresent(
+            recipe.Dtd,
+            recipe.DTD,
+            recipe.dtd,
+            recipe.NumberOfPackages,
+            recipe.Quantity,
+            text.match(/D\.?\s*t\.?\s*d\.?\s*:\s*([\d.,]+)/i)?.[1]
+        );
+    }
+
+    function getLatestStoredRecipeGroup() {
+        const recipes = getStoredRecipes();
+
+        if (!recipes.length) {
             return [];
         }
 
-        const nodes = [];
+        const dated = recipes
+            .filter(recipe =>
+                String(recipe.tradeName || recipe.mnn || recipe.rp || '').trim()
+            )
+            .map((recipe, index) => ({
+                recipe,
+                index,
+                date: parseRecipeDate(recipe.recipeDate)
+            }))
+            .sort((a, b) => b.date - a.date || a.index - b.index);
 
-        tree.querySelectorAll(
-            'li.file[data-id]'
-        ).forEach(
-            function (li) {
+        if (!dated.length) return [];
 
-                const id =
-                    li.getAttribute(
-                        'data-id'
-                    );
+        const latestDate = dated[0].date;
 
-                if (!id) {
-                    return;
-                }
-
-                const text =
-                    String(
-                        li.textContent || ''
-                    )
-                    .replace(
-                        /\s+/g,
-                        ' '
-                    )
-                    .trim();
-
-                const date =
-                    parseRecordDate(
-                        text
-                    );
-
-                if (!date) {
-                    return;
-                }
-
-                nodes.push({
-                    id: String(id),
-                    text: text,
-                    date: date,
-                    element: li
-                });
-
-            }
-        );
-
-        log(
-            'Найдено записей в дереве:',
-            nodes.length
-        );
-
-        return nodes;
+        // Все препараты одного последнего заполненного визита.
+        // Если последний месяц был пустым, его в хранилище нет,
+        // поэтому автоматически берётся предыдущий непустой месяц.
+        return dated
+            .filter(item => item.date === latestDate)
+            .map(item => item.recipe);
     }
 
+    function chooseStoredRecipe() {
+        const recipes = getStoredRecipes();
+        if (!recipes.length) return null;
 
-    // =========================================================
-    // ПОПЫТКА НАЙТИ ПРЕДЫДУЩУЮ
-    // =========================================================
+        const list = recipes.map((recipe, index) =>
+            `${index + 1}. ${getRecipeSearchText(recipe) || 'Препарат'} ` +
+            `— ${recipe.dosageConcentration ?? recipe.dosage ?? 'доза не указана'} ` +
+            `— ${recipe.recipePackQty ?? '?'} уп.`
+        ).join('\n');
 
-    function tryFindPreviousRecord(
-        currentId
-    ) {
+        const answer = prompt(
+            'Выбери предыдущий рецепт:\n\n' + list + '\n\nВведи номер:'
+        );
 
-        const records =
-            getRecordNodes();
+        if (answer === null) return null;
 
-        if (!records.length) {
-            return null;
-        }
-
-        const current =
-            records.find(
-                item =>
-                    String(item.id) ===
-                    String(currentId)
-            );
-
-        if (!current) {
-            return null;
-        }
-
-        const previous =
-            records
-                .filter(
-                    item =>
-                        String(item.id) !==
-                            String(currentId) &&
-                        item.date <
-                            current.date
-                )
-                .sort(
-                    (a, b) =>
-                        b.date - a.date
-                )[0];
-
-        if (!previous) {
+        const index = Number(answer) - 1;
+        if (!Number.isInteger(index) || index < 0 || index >= recipes.length) {
+            alert('Неверный номер рецепта.');
             return null;
         }
 
         return {
-            current: current,
-            previous: previous
+            recipe: recipes[index],
+            position: index + 1,
+            total: recipes.length
         };
     }
 
+    function getRecipeSearchText(recipe) {
+        const source = [
+            recipe.tradeName,
+            recipe.mnn,
+            recipe.rp,
+            recipe.Rp,
+            recipe.dosageForm
+        ].filter(Boolean).join(' ').toLowerCase();
 
-    // =========================================================
-    // АВТОМАТИЧЕСКИ ЗАГРУЖАЕМ ДЕРЕВО
-    // =========================================================
-
-    async function loadRecordsTree(
-        currentId
-    ) {
-
-        log(
-            '→ Начинаем автоматический поиск предыдущей записи'
-        );
-
-        let tree =
-            document.querySelector(
-                '#MedRecordsTreeView'
-            );
-
-        // Если само дерево ещё не существует,
-        // открываем список медицинских записей.
-
-        if (!tree) {
-
-            log(
-                '→ Дерево отсутствует'
-            );
-
-            try {
-
-                if (
-                    typeof window.showMedicalRecordsList ===
-                    'function'
-                ) {
-
-                    log(
-                        '→ Вызываем штатную showMedicalRecordsList()'
-                    );
-
-                    window.showMedicalRecordsList();
-
-                }
-
-            } catch (e) {
-
-                log(
-                    '⚠ showMedicalRecordsList:',
-                    e
-                );
-
-            }
-
-
-            // Дополнительная попытка через кнопку
-
-            await sleep(500);
-
-            tree =
-                document.querySelector(
-                    '#MedRecordsTreeView'
-                );
-
-            if (!tree) {
-
-                const elements =
-                    Array.from(
-                        document.querySelectorAll(
-                            'a, button, span, div'
-                        )
-                    );
-
-                const target =
-                    elements.find(
-                        el =>
-                            String(
-                                el.textContent || ''
-                            )
-                            .replace(/\s+/g, ' ')
-                            .trim()
-                            .toLowerCase()
-                            === 'все записи'
-                    );
-
-                if (target) {
-
-                    log(
-                        '→ Нажимаем "Все записи"'
-                    );
-
-                    try {
-                        target.click();
-                    } catch (e) {
-                        log(
-                            '⚠ Кнопка "Все записи":',
-                            e
-                        );
-                    }
-
-                }
-
-            }
-
-        }
-
-
-        // Ждём появления дерева
-
-        for (
-            let i = 0;
-            i < 40;
-            i++
+        if (
+            source.includes('рисполепт конста') ||
+            source.includes('rispolept consta') ||
+            (source.includes('рисперидон') && source.includes('инъек'))
         ) {
-
-            tree =
-                document.querySelector(
-                    '#MedRecordsTreeView'
-                );
-
-            if (tree) {
-                break;
-            }
-
-            await sleep(250);
+            return 'Конста';
         }
 
-        if (!tree) {
-
-            throw new Error(
-                'Дерево медицинских записей не появилось.'
-            );
-
-        }
-
-        log(
-            '✓ Дерево найдено'
-        );
-
-
-        // Сначала раскрываем именно период текущей записи.
-
-        await expandCurrentRecordParents(
-            currentId
-        );
-
-
-        // Проверяем, не появилась ли предыдущая запись
-        // после загрузки текущего периода.
-
-        for (
-            let attempt = 0;
-            attempt < 20;
-            attempt++
-        ) {
-
-            const found =
-                tryFindPreviousRecord(
-                    currentId
-                );
-
-            if (found) {
-
-                log(
-                    '✓ Предыдущая запись найдена автоматически:',
-                    found.previous.id
-                );
-
-                return found;
-            }
-
-            await sleep(250);
-        }
-
-
-        // =====================================================
-        // ИДЁМ ПО ПЕРИОДАМ ДЕРЕВА
-        // =====================================================
-
-        // ВАЖНО:
-        // список периодов получаем заново после каждой загрузки,
-        // потому что DMED может перерисовать дерево после AJAX.
-
-        let loaders =
-            Array.from(
-                tree.querySelectorAll(
-                    'li.k-item:has(.med-records-loader)'
-                )
-            );
-
-        if (!loaders.length) {
-
-            log(
-                '⚠ В дереве не найдены периоды для загрузки'
-            );
-
-        }
-
-        log(
-            'Периодов в дереве:',
-            loaders.length
-        );
-
-
-        // Находим период текущей записи.
-
-        const currentFile =
-            tree.querySelector(
-                '.file[data-id="' +
-                CSS.escape(String(currentId)) +
-                '"]'
-            );
-
-        let currentPeriod = null;
-
-        if (currentFile) {
-
-            let node =
-                currentFile.parentElement;
-
-            while (node) {
-
-                if (
-                    node.matches &&
-                    node.matches('li.k-item') &&
-                    node.querySelector('.med-records-loader')
-                ) {
-
-                    currentPeriod = node;
-                    break;
-                }
-
-                node =
-                    node.parentElement;
-            }
-        }
-
-
-        let startIndex = 0;
-
-        if (currentPeriod) {
-
-            const index =
-                loaders.indexOf(
-                    currentPeriod
-                );
-
-            if (index >= 0) {
-                startIndex = index;
-            }
-        }
-
-
-        // Периоды в DMED идут от новых к старым.
-
-        for (
-            let i = startIndex;
-            i < loaders.length;
-            i++
-        ) {
-
-            // Каждый раз заново получаем список периодов.
-
-            loaders =
-                Array.from(
-                    tree.querySelectorAll(
-                        'li.k-item:has(.med-records-loader)'
-                    )
-                );
-
+        if (source.includes('галоперидол') || source.includes('haloperidol')) {
             if (
-                i >= loaders.length
+                source.includes('деканоат') ||
+                source.includes('decanoate') ||
+                source.includes('масля') ||
+                source.includes('инъек')
             ) {
-                break;
+                return 'Деканоат';
             }
 
-            const item =
-                loaders[i];
-
-            try {
-
-                const label =
-                    String(
-                        item.textContent || ''
-                    )
-                    .replace(
-                        /\s+/g,
-                        ' '
-                    )
-                    .trim();
-
-
-                // -------------------------------------------------
-                // Сначала проверяем, не нашлась ли предыдущая запись
-                // уже в текущем состоянии дерева.
-                // -------------------------------------------------
-
-                let found =
-                    tryFindPreviousRecord(
-                        currentId
-                    );
-
-                if (found) {
-
-                    log(
-                        '✓ Предыдущая запись уже найдена:',
-                        found.previous.id
-                    );
-
-                    return found;
-                }
-
-
-                // -------------------------------------------------
-                // Определяем состояние периода.
-                // -------------------------------------------------
-
-                const group =
-                    item.querySelector(
-                        ':scope > .k-group'
-                    );
-
-                const isExpanded =
-                    group &&
-                    String(
-                        group.style.display || ''
-                    )
-                    .toLowerCase() !== 'none';
-
-
-                // -------------------------------------------------
-                // Если период закрыт — открываем.
-                // -------------------------------------------------
-
-                if (!isExpanded) {
-
-                    const clickable =
-                        item.querySelector(
-                            ':scope > .k-top .k-in, :scope > .k-mid .k-in, :scope > .k-bot .k-in'
-                        );
-
-                    if (!clickable) {
-
-                        log(
-                            '⚠ Не найден .k-in для периода:',
-                            label
-                        );
-
-                        continue;
-                    }
-
-
-                    log(
-                        '→ Штатно кликаем период:',
-                        label
-                    );
-
-
-                    clickable.click();
-
-                } else {
-
-                    // -------------------------------------------------
-                    // Если период открыт, но в нём только одна запись,
-                    // это может быть только текущая запись.
-                    //
-                    // Поэтому запускаем его повторную загрузку.
-                    // -------------------------------------------------
-
-                    const periodRecords =
-                        group
-                            ? Array.from(
-                                group.querySelectorAll(
-                                    ':scope > li.file[data-id]'
-                                )
-                            )
-                            : [];
-
-                    if (
-                        periodRecords.length <= 1
-                    ) {
-
-                        log(
-                            '→ Период открыт, но содержит только',
-                            periodRecords.length,
-                            'запись:',
-                            label
-                        );
-
-
-                        const clickable =
-                            item.querySelector(
-                                ':scope > .k-top .k-in, :scope > .k-mid .k-in, :scope > .k-bot .k-in'
-                            );
-
-                        if (clickable) {
-
-                            // Закрываем.
-
-                            log(
-                                '→ Закрываем период:',
-                                label
-                            );
-
-                            clickable.click();
-
-
-                            // Ждём закрытия.
-
-                            for (
-                                let attempt = 0;
-                                attempt < 40;
-                                attempt++
-                            ) {
-
-                                await sleep(100);
-
-                                const livePeriods =
-                                    Array.from(
-                                        tree.querySelectorAll(
-                                            'li.k-item:has(.med-records-loader)'
-                                        )
-                                    );
-
-                                const livePeriod =
-                                    livePeriods.find(
-                                        p =>
-                                            String(
-                                                p.textContent || ''
-                                            )
-                                            .replace(/\s+/g, ' ')
-                                            .trim() === label
-                                    );
-
-                                if (
-                                    livePeriod &&
-                                    !(
-                                        livePeriod.getAttribute(
-                                            'aria-expanded'
-                                        ) === 'true'
-                                    )
-                                ) {
-                                    break;
-                                }
-                            }
-
-
-                            // Заново находим период.
-
-                            const livePeriods =
-                                Array.from(
-                                    tree.querySelectorAll(
-                                        'li.k-item:has(.med-records-loader)'
-                                    )
-                                );
-
-                            const livePeriod =
-                                livePeriods.find(
-                                    p =>
-                                        String(
-                                            p.textContent || ''
-                                        )
-                                        .replace(/\s+/g, ' ')
-                                        .trim() === label
-                                );
-
-
-                            if (livePeriod) {
-
-                                const reopened =
-                                    livePeriod.querySelector(
-                                        ':scope > .k-top .k-in, :scope > .k-mid .k-in, :scope > .k-bot .k-in'
-                                    );
-
-                                if (reopened) {
-
-                                    log(
-                                        '→ Повторно открываем период:',
-                                        label
-                                    );
-
-                                    reopened.click();
-
-                                }
-                            }
-
-                        }
-
-                    } else {
-
-                        log(
-                            '→ Период уже раскрыт:',
-                            label,
-                            '| записей:',
-                            periodRecords.length
-                        );
-
-                    }
-                }
-
-
-                // -------------------------------------------------
-                // Ждём AJAX.
-                // -------------------------------------------------
-
-                for (
-                    let attempt = 0;
-                    attempt < 40;
-                    attempt++
-                ) {
-
-                    found =
-                        tryFindPreviousRecord(
-                            currentId
-                        );
-
-                    if (found) {
-
-                        log(
-                            '✓ Предыдущая запись найдена в периоде:',
-                            label
-                        );
-
-                        return found;
-                    }
-
-                    await sleep(250);
-                }
-
-
-            } catch (e) {
-
-                log(
-                    '⚠ Ошибка раскрытия периода:',
-                    e
-                );
-
-            }
+            return 'Haloperidol';
         }
 
+        return String(recipe.tradeName || '').trim();
+    }
 
-        // =========================================================
-        // ПОСЛЕДНЯЯ ПРОВЕРКА
-        // =========================================================
+    function visible(element) {
+        return !!(
+            element &&
+            element.getClientRects().length &&
+            getComputedStyle(element).visibility !== 'hidden'
+        );
+    }
 
-        for (
-            let attempt = 0;
-            attempt < 12;
-            attempt++
-        ) {
+    async function waitFor(test, timeout = 6000) {
+        const end = Date.now() + timeout;
 
-            const found =
-                tryFindPreviousRecord(
-                    currentId
-                );
-
-            if (found) {
-                return found;
-            }
-
-            await sleep(250);
+        while (Date.now() < end) {
+            const result = test();
+            if (result) return result;
+            await new Promise(resolve => setTimeout(resolve, 100));
         }
-
 
         return null;
-
     }
 
+    async function ensureAloRecipeForm() {
+        let search = document.querySelector('#tbSearchFreeMedication');
+        if (search) return search;
 
-    // =========================================================
-    // ПОЛУЧАЕМ HTML ПРЕДЫДУЩЕЙ ЗАПИСИ
-    // =========================================================
-
-    async function fetchPreviousRecordHtml(
-        previousId
-    ) {
-
-        log(
-            '→ Получаем MedRecordEditor:',
-            previousId
-        );
-
-        const response =
-            await fetch(
-                '/MedicalRecords/MedRecordEditor',
-                {
-                    method: 'POST',
-
-                    credentials:
-                        'same-origin',
-
-                    headers: {
-                        'Content-Type':
-                            'application/x-www-form-urlencoded; charset=UTF-8'
-                    },
-
-                    body:
-                        'MedRecordID=' +
-                        encodeURIComponent(
-                            previousId
-                        )
-                }
+        const aloTab = [...document.querySelectorAll('a, button, span, div')]
+            .find(element =>
+                visible(element) &&
+                String(element.textContent || '')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase() === 'рецепты ало'
             );
 
-        if (!response.ok) {
-
-            throw new Error(
-                'MedRecordEditor вернул HTTP ' +
-                response.status
-            );
-
+        if (aloTab) {
+            aloTab.click();
+            await new Promise(resolve => setTimeout(resolve, 300));
         }
 
-        const html =
-            await response.text();
+        search = await waitFor(() =>
+            document.querySelector('#tbSearchFreeMedication'), 1200
+        );
+        if (search) return search;
 
+        const addButton = [...document.querySelectorAll(
+            '.k-grid-add, [title*="Добав" i], [aria-label*="Добав" i], a, button'
+        )].find(element => {
+            if (!visible(element)) return false;
+            const text = String(element.textContent || '').trim();
+            return element.matches('.k-grid-add, [title*="Добав" i], [aria-label*="Добав" i]') ||
+                text === '+';
+        });
+
+        if (addButton) addButton.click();
+
+        return await waitFor(() =>
+            document.querySelector('#tbSearchFreeMedication'), 6000
+        );
+    }
+
+    // ------------------------------------------------------------
+    // 1. Определение торгового названия
+    // ------------------------------------------------------------
+
+    function getTradeNameFallback(recipe) {
+        const mnn = String(
+            recipe.mnn ||
+            parseMnnFromRp(recipe.Rp) ||
+            ''
+        )
+            .trim()
+            .toLowerCase();
+
+        const dosage = String(
+            recipe.Dosage ??
+            ''
+        ).trim();
+
+        const form = parseForm(recipe);
+
+        const rp = String(
+            recipe.Rp ||
+            ''
+        ).trim().toLowerCase();
+
+        // Клозапин
+        if (mnn.includes('клозапин')) {
+            return 'Азалептол';
+        }
+
+        // Галоперидол деканоат
         if (
-            !html ||
-            !html.trim()
+            mnn.includes('галоперидол') &&
+            (
+                rp.includes('деканоат') ||
+                form.includes('масля') ||
+                form.includes('инъек')
+            )
         ) {
-
-            throw new Error(
-                'MedRecordEditor вернул пустой ответ.'
-            );
-
+            return 'Деканоат';
         }
 
-        return html;
-    }
-
-
-    // =========================================================
-    // ИЗВЛЕКАЕМ ТЕКСТ
-    // =========================================================
-
-    function extractPreviousText(
-        html
-    ) {
-
-        const parser =
-            new DOMParser();
-
-        const doc =
-            parser.parseFromString(
-                html,
-                'text/html'
-            );
-
-        const textareas =
-            Array.from(
-                doc.querySelectorAll(
-                    'textarea[id^="tinyeditor_"]'
-                )
-            );
-
-        if (!textareas.length) {
-
-            throw new Error(
-                'В ответе MedRecordEditor не найден textarea предыдущей записи.'
-            );
-
+        // Венлафаксин
+        if (mnn.includes('венлафаксин')) {
+            return 'Алвента';
         }
 
-        const textarea =
-            textareas[0];
-
-        const value =
-            textarea.value || '';
-
-        if (!value.trim()) {
-
-            throw new Error(
-                'Textarea предыдущей записи найден, но пустой.'
-            );
-
+        // Амисульприд
+        if (mnn.includes('амисульприд')) {
+            return 'Амисульприд Санто';
         }
 
-        log(
-            '✓ Текст предыдущей записи получен.',
-            'Символов:',
-            value.length
-        );
-
-        return value;
-    }
-
-
-    // =========================================================
-    // ВСТАВКА В ТЕКУЩИЙ TINYEDITOR
-    // =========================================================
-
-
-async function insertIntoCurrentEditor(
-    currentId,
-    html
-) {
-
-    log(
-        '→ Ищем текущий TinyEditor:',
-        'editor_' + currentId
-    );
-
-    let editorInfo = null;
-
-    for (let i = 0; i < 40; i++) {
-
-        editorInfo =
-            getCurrentTinyEditor(
-                currentId
-            );
-
-        if (editorInfo) {
-            break;
+        // Хлорпромазин
+        if (mnn.includes('хлорпромазин')) {
+            return 'Аминазин';
         }
 
-        await sleep(250);
-    }
+        // Амитриптилин
+        if (mnn.includes('амитриптилин')) {
+            return 'Амитриптилин-ТК';
+        }
 
-    if (!editorInfo) {
+        // Обычный галоперидол
+        if (mnn.includes('галоперидол')) {
+            return 'Haloperidol';
+        }
 
-        throw new Error(
-            'Текущий TinyEditor не найден: editor_' +
-            currentId
-        );
-    }
-
-    const editor = editorInfo.editor;
-    const editorContext = editorInfo.context;
-
-    log(
-        '✓ Текущий TinyEditor найден:',
-        'editor_' + currentId
-    );
-
-
-    // =========================================================
-    // Получаем document TinyEditor
-    // =========================================================
-
-    const iframeDoc = editor.e;
-
-    if (!iframeDoc) {
-
-        throw new Error(
-            'TinyEditor найден, но editor.e не содержит document.'
-        );
-    }
-
-    log(
-        '✓ Document TinyEditor получен через editor.e'
-    );
-
-
-    // =========================================================
-    // Получаем body
-    // =========================================================
-
-    const body =
-        iframeDoc.getElementById(
-            editor.obj.bodyid
-        ) ||
-        iframeDoc.querySelector('body');
-
-    if (!body) {
-
-        throw new Error(
-            'Body TinyEditor не найден.'
-        );
-    }
-
-    log(
-        '✓ Body TinyEditor найден'
-    );
-
-
-    // =========================================================
-    // 1. Очищаем старое содержимое
-    // =========================================================
-
-    body.innerHTML = '';
-
-    if (editor.t) {
-
-        editor.t.value = '';
-
-    }
-
-
-    // =========================================================
-    // 2. Вставляем HTML непосредственно в body
-    // =========================================================
-
-    body.innerHTML = html;
-
-    log(
-        '✓ HTML вставлен непосредственно в body TinyEditor'
-    );
-
-
-    // =========================================================
-    // 3. Синхронизируем textarea
-    // =========================================================
-
-    if (editor.t) {
-
-        editor.t.value = html;
-
-        log(
-            '✓ Textarea синхронизирован:',
-            editor.t.id
-        );
-
-        editor.t.dispatchEvent(
-            new editorContext.Event(
-                'input',
-                {
-                    bubbles: true
-                }
+        // Ксеплион
+        if (
+            mnn.includes('палиперидон') &&
+            (
+                dosage === '100' ||
+                dosage === '150' ||
+                form.includes('инъек')
             )
-        );
+        ) {
+            return 'Ксеплион';
+        }
 
-        editor.t.dispatchEvent(
-            new editorContext.Event(
-                'change',
-                {
-                    bubbles: true
-                }
+        // Олфрекс
+        if (mnn.includes('оланзапин')) {
+            return 'Олфрекс';
+        }
+
+        // Палиперидон в таблетках
+        if (mnn.includes('палиперидон')) {
+            return 'Палиперидон';
+        }
+
+        // Рисполепт Конста
+        if (
+            mnn.includes('рисперидон') &&
+            (
+                dosage === '25' ||
+                dosage === '37.5' ||
+                dosage === '37,5' ||
+                rp.includes('конста')
             )
-        );
-    }
-
-
-    // =========================================================
-    // 4. Даем DMED/TinyEditor время обработать изменение
-    // =========================================================
-
-    await sleep(300);
-
-
-    log(
-        '✓ Текст предыдущей записи вставлен'
-    );
-
-// ---------------------------------------------------------
-// 5. Запускаем штатное сохранение DMED
-// ---------------------------------------------------------
-
-try {
-
-    const recordsRegistry = editorContext.MedicalRecords || window.MedicalRecords;
-    const medicalRecord = recordsRegistry && recordsRegistry['md_' + currentId];
-
-    if (!medicalRecord) {
-
-        throw new Error(
-            'MedicalRecords для текущей записи не найден: md_' +
-            currentId
-        );
-    }
-
-    log(
-        '→ Запускаем штатное сохранение текущей записи'
-    );
-
-    const saveResult = medicalRecord.saveMedicalRecordDocumentText();
-    if (saveResult && typeof saveResult.then === 'function') {
-        await saveResult;
-    }
-
-    log(
-        '✓ Штатное сохранение текущей записи завершено'
-    );
-
-    await reopenCurrentRecord(currentId);
-} catch (e) {
-
-    log(
-        '⚠ Ошибка штатного сохранения:',
-        e
-    );
-
-           throw e;
-    }
-}
-
-// =========================================================
-// АВТОМАТИЧЕСКИ РАСШИРЯЕМ ДИАПАЗОН ДАТ
-// =========================================================
-
-async function prepareDateRangeForPreviousRecord(currentId) {
-
-    log('→ Подготавливаем диапазон дат для поиска предыдущей записи');
-
-    const beginInput = document.getElementById('CriterionBeginDate');
-    const endInput = document.getElementById('CriterionEndDate');
-
-    if (!beginInput || !endInput) {
-        log('⚠ Поля календаря не найдены');
-        return;
-    }
-
-    // Получаем дату текущей записи
-    let currentDate = null;
-
-    try {
-        const tree = document.querySelector('#MedRecordsTreeView');
-
-        if (tree && currentId) {
-
-            const currentFile = tree.querySelector(
-                '.file[data-id="' +
-                CSS.escape(String(currentId)) +
-                '"]'
-            );
-
-            if (currentFile) {
-
-                const text = String(
-                    currentFile.textContent || ''
-                ).replace(/\s+/g, ' ').trim();
-
-                currentDate = parseRecordDate(text);
+        ) {
+            if (
+                dosage === '37.5' ||
+                dosage === '37,5' ||
+                rp.includes('37,5')
+            ) {
+                return 'Конста';
             }
+
+            return 'Конста';
         }
-    } catch (e) {
-        log('⚠ Не удалось получить дату текущей записи:', e);
-    }
 
-    // Если дату из дерева получить не удалось —
-    // используем сегодняшнюю дату.
-    if (!currentDate) {
-        currentDate = new Date();
-    }
+        // Рисперидон
+        if (mnn.includes('рисперидон')) {
+            return 'Рисперидон';
+        }
 
-    // Начинаем поиск с 5 лет назад.
-    const beginDate = new Date(currentDate);
-    beginDate.setFullYear(
-        beginDate.getFullYear() - 5
-    );
+        // Тизерцин / левомепромазин
+        if (mnn.includes('левомепромазин')) {
+            return 'Тизерцин';
+        }
 
-    const endDate = new Date(currentDate);
-
-    log(
-        '→ Новый диапазон:',
-        beginDate.toLocaleDateString('ru-RU'),
-        '—',
-        endDate.toLocaleDateString('ru-RU')
-    );
-
-    // ---------------------------------------------------------
-    // Получаем Kendo DatePicker
-    // ---------------------------------------------------------
-
-    let beginPicker = null;
-    let endPicker = null;
-
-    try {
-
+        // Тревикта
         if (
-            typeof jQuery !== 'undefined' &&
-            jQuery.fn &&
-            jQuery.fn.data
+            mnn.includes('палиперидон') &&
+            (
+                dosage === '350' ||
+                dosage === '525'
+            )
         ) {
+            if (dosage === '525') {
+                return 'Тревикта 525 мг';
+            }
 
-            beginPicker =
-                jQuery(beginInput)
-                    .data('kendoDatePicker');
-
-            endPicker =
-                jQuery(endInput)
-                    .data('kendoDatePicker');
+            return 'Тревикта 350 мг';
         }
 
-    } catch (e) {
+        // Трифтазин-Здоровье / трифлуоперазин
+        if (
+            mnn.includes('трифлуоперазин')
+        ) {
+            return 'Трифтазин-Здоровье';
+        }
 
-        log(
-            '⚠ Ошибка получения Kendo DatePicker:',
-            e
-        );
+        // Циклодол / тригексифенидил
+        if (
+            mnn.includes('тригексифенидил') ||
+            mnn.includes('тригексифенидила')
+        ) {
+            return 'Циклодол';
+        }
+
+        return null;
     }
 
-    if (!beginPicker || !endPicker) {
+    function getTradeNameFromPage(recipe) {
 
-        log(
-            '⚠ Kendo DatePicker не найден'
-        );
+        // --------------------------------------------------------
+        // Сначала определяем торговое название по МНН.
+        // Это не позволяет взять чужой препарат с текущей страницы.
+        // --------------------------------------------------------
 
-        return;
-    }
+        const fallback = getTradeNameFallback(recipe);
 
-    // ---------------------------------------------------------
-    // Меняем даты через API Kendo
-    // ---------------------------------------------------------
-
-    try {
-
-        beginPicker.value(beginDate);
-        endPicker.value(endDate);
-
-        // Одно изменение достаточно для обновления диапазона.
-        // Четыре события подряд в старой версии запускали несколько AJAX-обновлений.
-        endPicker.trigger('change');
-
-    } catch (e) {
-
-        log(
-            '⚠ Ошибка изменения диапазона дат:',
-            e
-        );
-
-        return;
-    }
-
-    log(
-        '✓ Диапазон дат установлен'
-    );
-
-    // ---------------------------------------------------------
-    // Ждём, пока DMED обновит дерево
-    // ---------------------------------------------------------
-
-    await sleep(500);
-
-    for (let attempt = 0; attempt < 40; attempt++) {
-
-        const tree =
-            document.querySelector(
-                '#MedRecordsTreeView'
+        if (fallback) {
+            log(
+                'Торговое название определено по МНН:',
+                fallback
             );
 
-        if (tree) {
+            return fallback;
+        }
 
-            const records =
-                tree.querySelectorAll(
-                    'li.file[data-id]'
+        const html = document.documentElement.innerHTML;
+
+        // Ищем непосредственно в HTML страницы.
+        // DMED может использовать:
+        // обычный пробел
+        // &nbsp;
+        // &amp;nbsp;
+
+        const space = '(?:\\s|&nbsp;|&amp;nbsp;)*';
+
+        const match = html.match(
+            new RegExp(
+                'Таб\\.' +
+                space +
+                '([^<]+?)' +
+                space +
+                '\\d+(?:[.,]\\d+)?' +
+                space +
+                'мг' +
+                space +
+                '№' +
+                space +
+                '\\d+',
+                'i'
+            )
+        );
+
+        if (match) {
+            const tradeName = match[1]
+                .replace(/&nbsp;/gi, ' ')
+                .replace(/&amp;/gi, '&')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            log('Торговое название найдено:', tradeName);
+
+            return tradeName;
+        }
+
+        log('Торговое название по старому шаблону не найдено');
+
+        // --------------------------------------------------------
+        // ДОБАВЛЕНО:
+        // Для растворов, инъекций и других форм используем
+        // соответствие МНН → торговое название.
+        // Старую рабочую логику выше не трогаем.
+        // --------------------------------------------------------
+
+        const fallback2 = getTradeNameFallback(recipe);
+
+        if (fallback2) {
+            log(
+                'Торговое название определено по МНН:',
+                fallback2
+            );
+
+            return fallback2;
+        }
+
+        // Диагностика
+        const pos = html.toLowerCase().indexOf('таб.');
+
+        if (pos !== -1) {
+            log(
+                'Фрагмент HTML около Таб.:',
+                html.substring(pos, pos + 500)
+            );
+        }
+
+        return null;
+    }
+
+    function rememberPreviousRecipe() {
+        const recipes = getRecipesFromCurrentPage();
+
+        console.log('[DMED RX] RAW RECIPES:', recipes);
+
+        if (!recipes.length) {
+            alert(
+                'Не найден рецепт на текущей странице.\n\n' +
+                'Открой предыдущую запись → Рецепты АЛО → убедись, ' +
+                'что рецепты отображаются.'
+            );
+
+            return;
+        }
+
+        const saved = [];
+
+        for (const recipe of recipes) {
+            const mnn = parseMnnFromRp(recipe.Rp);
+
+            const simplified = {
+                ID: recipe.ID,
+
+                // МНН — для информации
+                mnn: mnn,
+
+                // Торговое название — именно его будем вводить в поиск DMED
+                tradeName: getTradeNameFromPage({
+                    ...recipe,
+                    mnn: mnn
+                }),
+
+                dosage: recipe.Dosage,
+                dosageConcentration: recipe.DosageConcentration,
+
+                dosageForm: recipe.DrugDosageForm,
+
+                recipePackQty: firstPresent(
+                    recipe.RecipePackQty,
+                    recipe.PackageQuantity,
+                    recipe.PackQty
+                ),
+
+                dtd: extractDtd(recipe),
+                ds: recipe.Ds,
+
+                useMethodName: extractUseMethod(recipe),
+
+                rp: recipe.Rp,
+
+                prescriptionNumber: recipe.PrescriptionNumber,
+
+                recipeDate: recipe.RecipeDate
+            };
+
+            saveRecipe(simplified);
+            saved.push(simplified);
+
+            log('Сохранён предыдущий рецепт:', simplified);
+        }
+
+        const list = saved.map(recipe =>
+            `${recipe.tradeName || recipe.rp || recipe.mnn} — ` +
+            `${recipe.dosageConcentration ?? recipe.dosage ?? 'доза не указана'} — ` +
+            `${recipe.recipePackQty ?? '?'} уп.`
+        ).join('\n');
+
+        alert(
+            'Предыдущие рецепты сохранены.\n\n' +
+            list
+        );
+    }
+
+    // ------------------------------------------------------------
+    // 2. Поиск препарата среди остатков
+    // ------------------------------------------------------------
+
+    function findAvailableDrugRow(recipe) {
+        const mnn = String(recipe.mnn || '').trim().toLowerCase();
+
+        // Для поиска используем реальную дозировку препарата.
+        // В некоторых рецептах recipe.Dosage содержит количество
+        // таблеток в упаковке (например, 25), а не дозировку препарата.
+        const dosage = String(
+    (
+        String(recipe.rp || recipe.Rp || '').match(
+            /,\s*([\d.,]+)\s*мг/i
+        )?.[1] ||
+        recipe.dosageConcentration ||
+        recipe.dosage ||
+        ''
+    )
+).trim();
+
+        const rows = [...document.querySelectorAll('tr')];
+
+        const candidates = rows.filter(row => {
+            const grid = getGridFromRow(row);
+
+            if (!grid) return false;
+
+            const item = grid.dataItem(row);
+
+            if (!item) return false;
+
+            const data = item.toJSON
+                ? item.toJSON()
+                : item;
+
+            const itemMnn = String(
+                data.DrugMNNName || ''
+            ).trim().toLowerCase();
+
+            const itemDosage = String(
+                data.Dosage ?? ''
+            ).trim();
+
+            const packages = Number(
+                data.StockInPackages || 0
+            );
+
+            const units = Number(
+                data.StockInUnits || 0
+            );
+
+            return (
+                itemMnn === mnn &&
+                itemDosage === dosage &&
+                (packages > 0 || units > 0)
+            );
+        });
+
+        if (!candidates.length) {
+            return null;
+        }
+
+        return candidates[0];
+    }
+
+    // ------------------------------------------------------------
+    // 3. Выбор способа введения
+    // ------------------------------------------------------------
+
+    function normalizeText(value) {
+        return String(value || '')
+            .toLowerCase()
+            .replace(/ё/g, 'е')
+            .replace(/[^a-zа-я0-9]+/gi, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    async function setUseMethod(name) {
+        if (!name) {
+            log('Способ введения не указан');
+            return false;
+        }
+
+        const combo = $('#cmbFreeUseMethods')
+            .data('kendoComboBox');
+
+        if (!combo) {
+            log('ComboBox способа введения не найден');
+            return false;
+        }
+
+        let methods = [];
+
+        for (let attempt = 0; attempt < 30; attempt++) {
+            methods = combo.dataSource
+                .data()
+                .map(x => x.toJSON ? x.toJSON() : x);
+
+            if (methods.length) break;
+
+            if (attempt === 0) {
+                try { combo.dataSource.read(); } catch (e) {}
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+
+        const wanted = normalizeText(name);
+        const methodName = x => normalizeText(
+            x.Name || x.NameRu || x.DisplayName || x.Text
+        );
+
+        // Сначала ищем актуальный вариант:
+        // EndDate == null
+        let matchIndex = methods.findIndex(x =>
+            methodName(x) === wanted &&
+            !x.EndDate
+        );
+
+        // Если не нашли — любой совпадающий
+        if (matchIndex < 0) {
+            matchIndex = methods.findIndex(x =>
+                methodName(x) === wanted
+            );
+        }
+
+        // В разных версиях справочника встречаются уточнения в скобках.
+        if (matchIndex < 0) {
+            matchIndex = methods.findIndex(x =>
+                methodName(x).includes(wanted) || wanted.includes(methodName(x))
+            );
+        }
+
+        if (matchIndex < 0) {
+            log('Не найден способ введения:', name);
+            return false;
+        }
+
+        const match = methods[matchIndex];
+
+        // Сначала выбираем именно строку ComboBox,
+        // затем синхронизируем его значение и событие change.
+        combo.select(matchIndex);
+        combo.value(String(match.ID));
+        combo.trigger('change');
+
+        log(
+            'Способ введения установлен:',
+            match.ID,
+            match.Name
+        );
+
+        return String(combo.value() || '') === String(match.ID) &&
+            !!String(combo.text?.() || combo.input?.val?.() || '').trim();
+    }
+
+    // ------------------------------------------------------------
+    // 4. Установка количества упаковок
+    // ------------------------------------------------------------
+
+    function setPackages(value) {
+        const input = document.querySelector(
+            '#ntbNumberOfPackages'
+        );
+
+        if (!input) {
+            log('Поле количества упаковок не найдено');
+            return false;
+        }
+
+        const match = String(value ?? '')
+            .replace(',', '.')
+            .match(/\d+(?:\.\d+)?/);
+
+        const quantity = match ? Number(match[0]) : NaN;
+
+        if (!Number.isFinite(quantity) || quantity <= 0) {
+            log('Некорректное количество:', value);
+            return false;
+        }
+
+        const numeric = $(input).data('kendoNumericTextBox');
+
+        if (numeric) {
+            numeric.value(quantity);
+            numeric.trigger('change');
+
+            // Дополнительно синхронизируем обычное input-поле,
+            // чтобы DMED не потерял значение при перерисовке формы.
+            input.value = String(quantity);
+            $(input).trigger('input');
+            $(input).trigger('change');
+        } else {
+            input.value = String(quantity);
+            $(input).trigger('change');
+            $(input).trigger('input');
+        }
+
+        log(
+            'Количество упаковок установлено:',
+            quantity
+        );
+
+        const actual = numeric
+            ? Number(numeric.value())
+            : Number(String(input.value).replace(',', '.'));
+
+        return Number.isFinite(actual) && actual === quantity;
+    }
+
+    // ------------------------------------------------------------
+    // 5. Перенос рецепта
+    // ------------------------------------------------------------
+
+    async function applyPreviousRecipe() {
+        const selection = chooseStoredRecipe();
+        const recipe = selection?.recipe;
+
+        if (!recipe) {
+            if (!getStoredRecipes().length) {
+                alert(
+                    'Нет сохранённого предыдущего рецепта.\n\n' +
+                    'Сначала открой предыдущую запись и нажми ' +
+                    '«Запомнить предыдущий рецепт».'
                 );
+            }
 
-            if (records.length > 0) {
+            return;
+        }
 
+        log(
+            `Применяем рецепт ${selection.position} из ${selection.total}:`,
+            recipe
+        );
+
+        // Проверяем, что форма рецепта открыта
+        const drugSearch = await ensureAloRecipeForm();
+
+        if (!drugSearch) {
+            alert(
+                'Не удалось автоматически открыть форму «Рецепты АЛО».\n\n' +
+                'Открой вкладку один раз и сообщи, если кнопка + выглядит иначе.'
+            );
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Выбираем категорию «Все категории, состоящие
+        // на динамическом наблюдении»
+        // --------------------------------------------------------
+
+        const categoryCombo =
+            $('#cmbPrescriptionCategory').data('kendoComboBox');
+
+        if (categoryCombo) {
+            categoryCombo.value('13');
+            categoryCombo.trigger('change');
+
+            log(
+                'Категория установлена:',
+                categoryCombo.value(),
+                categoryCombo.text()
+            );
+        }
+
+        // Ждём обновления таблицы остатков
+        await new Promise(resolve =>
+            setTimeout(resolve, 500)
+        );
+
+        // --------------------------------------------------------
+        // Ищем препарат через штатный поиск DMED
+        // --------------------------------------------------------
+
+        const searchInput = document.querySelector(
+            '#tbSearchFreeMedication'
+        );
+
+        if (!searchInput) {
+            alert('Поле поиска препарата не найдено.');
+            return;
+        }
+
+        const searchText = getRecipeSearchText(recipe);
+
+        if (!searchText) {
+            alert(
+                'Не удалось определить торговое наименование препарата.\n\n' +
+                'Открой предыдущую запись и убедись, что в тексте рецепта указано торговое название.'
+            );
+
+            return;
+        }
+
+        log('Ищем препарат через DMED:', searchText);
+
+        // --------------------------------------------------------
+        // Заполняем только поле поиска.
+        // Кнопку поиска DMED НЕ нажимаем.
+        // Ты нажимаешь её сам.
+        // --------------------------------------------------------
+
+        const searchWidget =
+            $(searchInput).data('kendoAutoComplete') ||
+            $(searchInput).data('kendoComboBox') ||
+            $(searchInput).data('kendoDropDownList');
+
+        if (searchWidget) {
+            searchWidget.value(searchText);
+
+            try {
+                searchWidget.trigger('change');
+                searchWidget.search?.(searchText);
+            } catch (e) {}
+
+            log(
+                'Значение поиска установлено через Kendo:',
+                searchText
+            );
+        } else {
+            searchInput.value = searchText;
+            searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+            searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+            log(
+                'Kendo-контрол не найден, значение вставлено напрямую:',
+                searchText
+            );
+        }
+
+        // --------------------------------------------------------
+        // Автоматически запускаем штатный поиск
+        // --------------------------------------------------------
+
+        const searchButton =
+            document.querySelector('#btnSearchFreeMedication') ||
+            searchInput.parentElement?.querySelector('button, .k-button, a');
+
+        if (searchButton && visible(searchButton)) {
+            searchButton.click();
+        } else {
+            searchInput.dispatchEvent(new KeyboardEvent('keydown', {
+                key: 'Enter',
+                code: 'Enter',
+                keyCode: 13,
+                which: 13,
+                bubbles: true
+            }));
+        }
+
+        log('Ждём результат автоматического поиска DMED...');
+
+        let row = null;
+
+        for (let i = 0; i < 10; i++) {
+            row = findAvailableDrugRow(recipe);
+
+            if (row) {
+                log('Препарат найден автоматически');
+                break;
+            }
+
+            await new Promise(resolve =>
+                setTimeout(resolve, 500)
+            );
+        }
+
+        if (!row) {
+            alert(
+                'Препарат не найден автоматическим поиском DMED.\n\n' +
+                'Торговое наименование: ' +
+                (recipe.tradeName || 'не определено') + '\n' +
+                'МНН: ' +
+                (recipe.mnn || 'не определено') + '\n' +
+             'Дозировка: ' +
+(
+    recipe.dosageConcentration ||
+    (
+        String(recipe.rp || recipe.Rp || '').match(
+            /,\s*([\d.,]+)\s*мг/i
+        )?.[1] || ''
+    ) ||
+    recipe.dosage ||
+    'не определена'
+) + '\n\n' +
+                'Проверь наличие препарата в остатках.'
+            );
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Обрабатываем найденную строку препарата
+        // --------------------------------------------------------
+
+        const grid = getGridFromRow(row);
+        const item = grid.dataItem(row);
+
+        const drug = item.toJSON
+            ? item.toJSON()
+            : item;
+
+        log('Найден препарат:', drug);
+
+        const stockPackages =
+            Number(drug.StockInPackages || 0);
+
+        const stockUnits =
+            Number(drug.StockInUnits || 0);
+
+        log(
+            'Остаток:',
+            stockPackages,
+            'упаковок;',
+            stockUnits,
+            'единиц'
+        );
+
+        // --------------------------------------------------------
+        // Кликаем по найденному препарату
+        // --------------------------------------------------------
+
+        row.click();
+
+        $(row).trigger('click');
+
+        // --------------------------------------------------------
+        // ДОБАВЛЕНО:
+        // DMED после клика может ещё заполнять форму.
+        // Поэтому даём ему время и затем несколько раз
+        // устанавливаем сохранённые параметры.
+        // --------------------------------------------------------
+
+        await new Promise(resolve =>
+            setTimeout(resolve, 1000)
+        );
+
+        let methodSet = false;
+        let packagesSet = false;
+
+        for (let i = 0; i < 10; i++) {
+
+            // ----------------------------------------------------
+            // Способ введения
+            // ----------------------------------------------------
+
+            const savedMethod = firstPresent(
+                recipe.useMethodName,
+                String(recipe.ds || '').match(/^\s*([^,;]+)/)?.[1]
+            );
+
+            if (savedMethod) {
+                methodSet = await setUseMethod(
+                    savedMethod
+                );
+            } else {
+                const methodCombo = $('#cmbFreeUseMethods').data('kendoComboBox');
+                methodSet = !!String(
+                    methodCombo?.value?.() || methodCombo?.text?.() || ''
+                ).trim();
+            }
+
+            // Даём DMED время обработать change способа введения
+            // до установки количества упаковок.
+            await new Promise(resolve =>
+                setTimeout(resolve, 150)
+            );
+
+            // ----------------------------------------------------
+            // Количество упаковок
+            // ----------------------------------------------------
+
+            const quantity = firstPresent(
+                recipe.dtd,
+                recipe.Dtd,
+                recipe.recipePackQty
+            );
+
+            if (quantity != null && String(quantity).trim() !== '') {
+                packagesSet = setPackages(
+                    quantity
+                );
+            } else {
+                packagesSet = false;
+            }
+
+            if (methodSet && packagesSet) {
                 log(
-                    '✓ Дерево обновилось:',
-                    'записей в DOM =',
-                    records.length
+                    'Способ введения и количество успешно установлены'
                 );
 
-                return;
+                break;
             }
+
+            await new Promise(resolve =>
+                setTimeout(resolve, 300)
+            );
         }
 
-        await sleep(250);
-    }
-
-    log(
-        '⚠ Дерево после изменения диапазона не подтвердило загрузку записей'
-    );
-}
-    // =========================================================
-    // ОСНОВНАЯ ФУНКЦИЯ
-    // =========================================================
-
-    async function transferPreviousRecord() {
-
-        if (transferInProgress) {
-            log('Перенос уже выполняется…');
+        if (!methodSet || !packagesSet) {
+            alert(
+                'Препарат выбран, но не удалось перенести: ' +
+                [
+                    !methodSet ? 'способ введения' : '',
+                    !packagesSet ? 'количество' : ''
+                ].filter(Boolean).join(' и ') +
+                '.\n\nПерезапомни этот рецепт из предыдущей записи: в старом сохранении этих данных может не быть.'
+            );
             return;
         }
 
-        transferInProgress = true;
-        const button = document.getElementById('damumed-transfer-previous-record');
-        if (button) {
-            button.disabled = true;
-            button.textContent = 'Переносим…';
-        }
+        log('Заполнение завершено и проверено');
 
-        try {
-
-            const currentId =
-                getCurrentMedRecordId();
-
-            if (!currentId) {
-
-                throw new Error(
-                    'Не удалось определить ID текущей медицинской записи.'
-                );
-
-            }
-
-            log(
-                'Текущая запись:',
-                currentId
-            );
-
-
-           // Автоматически расширяем диапазон календаря,
-// чтобы предыдущие даты стали доступны.
-
-await prepareDateRangeForPreviousRecord(
-    currentId
-);
-
-// Автоматически загружаем/раскрываем дерево
-
-const pair =
-    await loadRecordsTree(
-        currentId
-    );
-
-            if (!pair) {
-
-                throw new Error(
-                    'Предыдущая медицинская запись не найдена.'
-                );
-
-            }
-
-
-            log(
-                'Текущая:',
-                pair.current.id,
-                pair.current.date.toLocaleString(
-                    'ru-RU'
-                )
-            );
-
-
-            log(
-                'Предыдущая:',
-                pair.previous.id,
-                pair.previous.date.toLocaleString(
-                    'ru-RU'
-                )
-            );
-
-
-            const previousHtml =
-                await fetchPreviousRecordHtml(
-                    pair.previous.id
-                );
-
-
-            const previousText =
-                extractPreviousText(
-                    previousHtml
-                );
-
-
-            await insertIntoCurrentEditor(
-                currentId,
-                previousText
-            );
-
-
-            log('✓ Предыдущая запись перенесена, сохранена и снова открыта.');
-
-
-        } catch (error) {
-
-            console.error(
-                PREFIX,
-                error
-            );
-
-            showStatus('Ошибка переноса: ' + error.message, true);
-        } finally {
-            transferInProgress = false;
-            if (button) {
-                button.disabled = false;
-                button.textContent = 'Перенести последнюю запись';
-            }
-        }
+        alert(
+            'Параметры предыдущего рецепта перенесены.\n\n' +
+            'Проверь форму перед сохранением.'
+        );
     }
 
+    // ------------------------------------------------------------
+    // 6. UI
+    // ------------------------------------------------------------
 
-    // =========================================================
-    // КНОПКА
-    // =========================================================
+    function createButton(text, title, handler) {
+        const button = document.createElement('button');
 
-    function createButton() {
+        button.type = 'button';
+        button.textContent = text;
 
-        if (
-            document.getElementById(
-                'damumed-transfer-previous-record'
-            )
-        ) {
+        button.title = title;
+
+        button.style.position = 'fixed';
+        button.style.right = '20px';
+        button.style.zIndex = '2147483647';
+
+        button.style.padding = '8px 12px';
+        button.style.border = '1px solid #aaa';
+        button.style.borderRadius = '5px';
+
+        button.style.background = '#fff';
+        button.style.cursor = 'pointer';
+
+        button.addEventListener('click', handler);
+
+        return button;
+    }
+
+    function addButtons() {
+        if (document.querySelector('#dmed-rx-save-btn')) {
             return;
         }
 
-
-        const button =
-            document.createElement(
-                'button'
-            );
-
-
-        button.id =
-            'damumed-transfer-previous-record';
-
-
-        button.type =
-            'button';
-
-
-        button.textContent =
-            'Перенести последнюю запись';
-
-
-        button.style.cssText = [
-
-            'position:fixed',
-            'right:20px',
-            'bottom:20px',
-            'z-index:2147483647',
-
-            'padding:10px 16px',
-
-            'border:1px solid #999',
-            'border-radius:4px',
-
-            'background:#f5f5f5',
-            'color:#333',
-
-            'font:14px Arial,sans-serif',
-
-            'cursor:pointer',
-
-            'box-shadow:0 2px 6px rgba(0,0,0,.2)'
-
-        ].join(';');
-
-
-        button.addEventListener(
-            'click',
-            function (event) {
-
-                event.preventDefault();
-
-                event.stopPropagation();
-
-                transferPreviousRecord();
-
-            }
+        const saveBtn = createButton(
+            '💾 Запомнить рецепт',
+            'Запомнить рецепт из текущей записи',
+            rememberPreviousRecipe
         );
 
+        saveBtn.id = 'dmed-rx-save-btn';
+        saveBtn.style.bottom = '105px';
 
-        document.body.appendChild(
-            button
+        const applyBtn = createButton(
+            '↻ Предыдущий рецепт',
+            'Заполнить новый рецепт данными предыдущего',
+            applyPreviousRecipe
         );
 
+        applyBtn.id = 'dmed-rx-apply-btn';
+        applyBtn.style.bottom = '65px';
 
-        log(
-            '✓ Кнопка создана'
-        );
+        document.body.appendChild(saveBtn);
+        document.body.appendChild(applyBtn);
     }
 
+    // ------------------------------------------------------------
+    // Старт
+    // ------------------------------------------------------------
 
-    // =========================================================
-    // ЗАПУСК
-    // =========================================================
-
-    function start() {
-
-        createButton();
-        enableFastDmedNotifications();
+    function init() {
+        addButtons();
 
         log(
-            '✓ Версия 2.2 запущена'
+            'Готов.',
+            'Сохранённые рецепты:',
+            getStoredRecipes()
         );
-    }
 
+        // DMED постоянно перерисовывает интерфейс.
+        // Если наши кнопки исчезли — возвращаем их.
+        setInterval(() => {
+            addButtons();
+        }, 1000);
+    }
 
     if (
-        document.readyState ===
-        'loading'
+        document.readyState === 'loading'
     ) {
-
         document.addEventListener(
             'DOMContentLoaded',
-            start
+            init
         );
-
     } else {
-
-        start();
-
+        init();
     }
 
 })();
