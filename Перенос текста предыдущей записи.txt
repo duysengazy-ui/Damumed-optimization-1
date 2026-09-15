@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Damumed — Перенос текста предыдущей записи AUTO
 // @namespace    damumed-transfer-previous-record
-// @version      2.1
+// @version      2.4
 // @description  Автоматически загружает дерево записей и переносит текст последнего предыдущего приёма
 // @match        https://doc-ast.dmed.kz/MedicalRecords*
 // @grant        none
@@ -63,6 +63,63 @@
         showStatus.timer = setTimeout(() => {
             status.style.display = 'none';
         }, isError ? 8000 : 3500);
+    }
+
+    function enableFastDmedNotifications() {
+        const scheduled = new WeakSet();
+        const wantedTexts = [
+            'данные успешно сохранены',
+            'напоминаем вам о необходимости заполнить заключение'
+        ];
+
+        const scan = root => {
+            root.querySelectorAll('.alert, [role="alert"]').forEach(notification => {
+                const text = String(notification.textContent || '')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+                    .toLowerCase();
+
+                if (
+                    scheduled.has(notification) ||
+                    !wantedTexts.some(fragment => text.includes(fragment))
+                ) {
+                    return;
+                }
+
+                scheduled.add(notification);
+                setTimeout(() => {
+                    if (!notification.isConnected) {
+                        return;
+                    }
+
+                    const close = notification.querySelector(
+                        '[data-dismiss="alert"], button.close, .close'
+                    );
+
+                    if (close) {
+                        close.click();
+                    } else {
+                        notification.remove();
+                    }
+                }, 2000);
+            });
+        };
+
+        const observeDocument = doc => {
+            scan(doc);
+            new MutationObserver(() => scan(doc)).observe(doc.documentElement, {
+                childList: true,
+                subtree: true
+            });
+        };
+
+        for (const context of getSameOriginWindows()) {
+            try {
+                observeDocument(context.document);
+            } catch (e) {
+                log('⚠ Не удалось включить быстрое закрытие уведомлений:', e);
+            }
+        }
     }
 
     async function reopenCurrentRecord(currentId) {
@@ -1035,7 +1092,7 @@
 
         for (
             let attempt = 0;
-            attempt < 20;
+            attempt < 6;
             attempt++
         ) {
 
@@ -1138,9 +1195,11 @@
 
         // Периоды в DMED идут от новых к старым.
 
+        const lastIndex = Math.min(loaders.length, startIndex + 6);
+
         for (
             let i = startIndex;
-            i < loaders.length;
+            i < lastIndex;
             i++
         ) {
 
@@ -1390,7 +1449,7 @@
 
                 for (
                     let attempt = 0;
-                    attempt < 40;
+                    attempt < 12;
                     attempt++
                 ) {
 
@@ -1547,7 +1606,13 @@
         }
 
         const textarea =
-            textareas[0];
+            textareas.find(item => String(item.value || '').trim());
+
+        if (!textarea) {
+            throw new Error(
+                'Редакторы предыдущей записи найдены, но все они пустые.'
+            );
+        }
 
         const value =
             textarea.value || '';
@@ -1778,6 +1843,8 @@ async function prepareDateRangeForPreviousRecord(currentId) {
 
     const beginInput = document.getElementById('CriterionBeginDate');
     const endInput = document.getElementById('CriterionEndDate');
+    const treeBeforeUpdate = document.querySelector('#MedRecordsTreeView');
+    const markupBeforeUpdate = treeBeforeUpdate?.innerHTML || '';
 
     if (!beginInput || !endInput) {
         log('⚠ Поля календаря не найдены');
@@ -1920,7 +1987,20 @@ async function prepareDateRangeForPreviousRecord(currentId) {
                     'li.file[data-id]'
                 );
 
-            if (records.length > 0) {
+            const currentRecord = tree.querySelector(
+                '.file[data-id="' + CSS.escape(String(currentId)) + '"]'
+            );
+            const treeWasUpdated =
+                tree !== treeBeforeUpdate ||
+                tree.innerHTML !== markupBeforeUpdate;
+
+            // Если диапазон уже был выставлен, DOM может не измениться вообще.
+            // После короткой выдержки принимаем валидное текущее дерево.
+            if (
+                records.length > 0 &&
+                currentRecord &&
+                (treeWasUpdated || attempt >= 3)
+            ) {
 
                 log(
                     '✓ Дерево обновилось:',
@@ -1976,19 +2056,15 @@ async function prepareDateRangeForPreviousRecord(currentId) {
             );
 
 
-           // Автоматически расширяем диапазон календаря,
-// чтобы предыдущие даты стали доступны.
+            // Быстрый путь: чаще всего обе записи уже находятся в DOM.
+            let pair = tryFindPreviousRecord(currentId);
 
-await prepareDateRangeForPreviousRecord(
-    currentId
-);
-
-// Автоматически загружаем/раскрываем дерево
-
-const pair =
-    await loadRecordsTree(
-        currentId
-    );
+            // Медленный запасной путь нужен только когда предыдущей записи
+            // действительно нет в уже загруженном диапазоне.
+            if (!pair) {
+                await prepareDateRangeForPreviousRecord(currentId);
+                pair = await loadRecordsTree(currentId);
+            }
 
             if (!pair) {
 
@@ -2145,9 +2221,10 @@ const pair =
     function start() {
 
         createButton();
+        enableFastDmedNotifications();
 
         log(
-            '✓ Версия 2.1 запущена'
+            '✓ Версия 2.4 запущена'
         );
     }
 
