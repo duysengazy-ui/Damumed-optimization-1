@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Damumed — Автозаполнение приёма CLEAN FIX
 // @namespace    damumed-auto-fill
-// @version      7.0
+// @version      8.1
 // @description  Автозаполнение приёма в Damumed
 // @match        *://*/*
 // @grant        none
@@ -47,6 +47,21 @@ function cfg(){
 
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const log=(...x)=>console.log('[Damumed Автозаполнение]',...x);
+
+async function waitUntil(test,timeout=4000,interval=50){
+ const end=Date.now()+timeout;
+
+ while(Date.now()<end){
+  try{
+   const value=test();
+   if(value)return value;
+  }catch(e){}
+
+  await sleep(interval);
+ }
+
+ return null;
+}
 
 function wins(){
  return typeof Ext!=='undefined'&&Ext.ComponentQuery
@@ -164,10 +179,12 @@ function fillReadmission(w){
 }
 
 async function fillTreatment(w){
- const n1=field(w,'node1');
- const n2=field(w,'node2');
+ const n1=await waitUntil(()=>{
+  const value=field(w,'node1');
+  return value?.objMask?value:null;
+ },3000);
 
- if(!n1||!n1.objMask){
+ if(!n1){
   log('⚠ Повод обращения: node1/objMask не найден');
   return false;
  }
@@ -225,44 +242,65 @@ async function fillTreatment(w){
   }
  }
 
- await sleep(400);
+ // fillingLevelStore создаёт node2 асинхронно. Каждый раз читаем
+ // компоненты заново, а не используем устаревший null.
+ const ready=await waitUntil(()=>{
+  const first=field(w,'node1');
+  const second=field(w,'node2');
+  return first&&second?{first,second}:null;
+ },3500);
+
+ if(!ready){
+  log('⚠ Повод обращения: второй список не успел создаться');
+  return false;
+ }
 
  const hidden=field(w,'TreatmentReasonID');
 
- if(hidden){
-  hidden.setValue(C.treatment2);
-
-  try{
-   hidden.fireEvent('change',hidden,C.treatment2,null);
-  }catch(e){}
- }
-
+ // Подстраховываем оба видимых combo и скрытое итоговое поле.
  try{
-  if(m.objValue){
-   m.objValue.setValue(C.treatment2);
-
-   try{
-    m.objValue.fireEvent('change',m.objValue,C.treatment2,null);
-   }catch(e){}
+  if(String(ready.first.getValue?.())!==C.treatment1){
+   ready.first.setValue(C.treatment1);
   }
 
+  if(String(ready.second.getValue?.())!==C.treatment2){
+   const store=ready.second.getStore?.();
+   if(store&&!rec(ready.second,C.treatment2))store.loadData([r2]);
+   ready.second.setValue(C.treatment2);
+  }
+
+  if(hidden)hidden.setValue(C.treatment2);
+  if(m.objValue)m.objValue.setValue(C.treatment2);
   m.rawData=C.treatment2;
 
-  if(typeof m.validationCheck==='function'){
-   m.validationCheck();
-  }
- }catch(e){}
+  ready.second.fireEvent?.('select',ready.second,[rec(ready.second,C.treatment2)||r2]);
+  ready.second.fireEvent?.('change',ready.second,C.treatment2,null);
+  hidden?.fireEvent?.('change',hidden,C.treatment2,null);
+  m.objValue?.fireEvent?.('change',m.objValue,C.treatment2,null);
+  m.validationCheck?.();
+ }catch(e){
+  log('❌ Ошибка фиксации повода обращения:',e);
+  return false;
+ }
 
- await sleep(300);
+ const ok=await waitUntil(()=>{
+  const first=field(w,'node1');
+  const second=field(w,'node2');
+  const result=field(w,'TreatmentReasonID');
+
+  return String(first?.getValue?.())===C.treatment1&&
+   String(second?.getValue?.())===C.treatment2&&
+   String(result?.getValue?.())===C.treatment2;
+ },1500);
 
  log(
-  '✓ Повод обращения:',
-  'node1=',n1.getValue?.(),
-  'node2=',n2?.getValue?.(),
-  'TreatmentReasonID=',hidden?.getValue?.()
+  ok?'✓ Повод обращения заполнен':'⚠ Повод обращения не прошёл проверку',
+  'node1=',field(w,'node1')?.getValue?.(),
+  'node2=',field(w,'node2')?.getValue?.(),
+  'TreatmentReasonID=',field(w,'TreatmentReasonID')?.getValue?.()
  );
 
- return String(hidden?.getValue?.())===C.treatment2;
+ return !!ok;
 }
 
 async function fillFinance(w){
@@ -312,9 +350,25 @@ async function fillBooking(w){
  await fillSchedule(w);
  await fillService(w);
  fillReadmission(w);
- await fillTreatment(w);
- await sleep(200);
  await fillFinance(w);
+
+ // Источник финансирования перестраивает зависимые поля ExtJS,
+ // поэтому повод обращения обязательно заполняем последним.
+ await fillTreatment(w);
+
+ // Даём последним AJAX/listener-обработчикам Damumed завершиться.
+ // Если компонент был пересоздан и значение исчезло — восстанавливаем.
+ await sleep(350);
+
+ const treatmentOk=
+  String(field(w,'node1')?.getValue?.())===C.treatment1&&
+  String(field(w,'node2')?.getValue?.())===C.treatment2&&
+  String(field(w,'TreatmentReasonID')?.getValue?.())===C.treatment2;
+
+ if(!treatmentOk){
+  log('→ Damumed перерисовал повод обращения, заполняем повторно');
+  await fillTreatment(w);
+ }
 
  log('✓ Первое окно заполнено');
 }
@@ -824,7 +878,7 @@ function start(){
  positionButton();
  positionNarcButton();
 
- log('✓ CLEAN FIX 7.0 запущен');
+ log('✓ CLEAN FIX 8.1 запущен');
 }
 
 const timer=setInterval(()=>{
