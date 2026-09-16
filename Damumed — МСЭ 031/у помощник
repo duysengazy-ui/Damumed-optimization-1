@@ -1,0 +1,652 @@
+// ==UserScript==
+// @name         Damumed — МСЭ 031/у помощник
+// @namespace    damumed-mse-031-helper
+// @version      1.2
+// @description  Открывает и предварительно заполняет форму 031/у для МСЭ без сохранения
+// @match        https://doc-ast.dmed.kz/MedicalRecords*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const PREFIX = '[МСЭ 031/у]';
+    const FORM_TITLE = 'Заключение на медико-социальную экспертизу (031/у объединенная)';
+    const DEFAULTS = {
+        workStatus: 'не работает',
+        referralPurpose: 'Переосвидетельствование',
+        disabilityGroup: 'Третья группа',
+        remoteExamination: 'Заочное проактивное освидетельствование',
+        treatmentDynamics: 'Без динамики',
+        rehabilitationResult: 'Отсутствие положительного результата',
+        rehabilitationPrognosis: 'Сомнительный',
+        rehabilitationPotential: 'Средний',
+        vitals: {
+            pressureSystolic: 120,
+            pressureDiastolic: 80,
+            pulse: 78,
+            temperature: 36.6,
+            waist: 80,
+            leftThigh: 40,
+            rightThigh: 40,
+            weight: 80,
+            height: 176,
+            respirationRate: 16
+        }
+    };
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const log = (...args) => console.log(PREFIX, ...args);
+
+    function realMouseClick(element) {
+        if (!element) return;
+        const rect = element.getBoundingClientRect();
+        const clientX = rect.left + Math.min(rect.width / 2, 24);
+        const clientY = rect.top + rect.height / 2;
+        const options = { bubbles: true, cancelable: true, view: window, button: 0, clientX, clientY };
+        if (window.PointerEvent) {
+            element.dispatchEvent(new PointerEvent('pointerdown', { ...options, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+        }
+        element.dispatchEvent(new MouseEvent('mousedown', options));
+        if (window.PointerEvent) {
+            element.dispatchEvent(new PointerEvent('pointerup', { ...options, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+        }
+        element.dispatchEvent(new MouseEvent('mouseup', options));
+        element.dispatchEvent(new MouseEvent('click', options));
+    }
+
+    function selectedCertificateShell(element) {
+        let node = element;
+        while (node && node !== document.body) {
+            if (node.matches?.('.k-state-selected,.k-selected,[aria-selected="true"],.selected,.active')) return node;
+            const style = getComputedStyle(node);
+            const match = style.backgroundColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+            if (match) {
+                const [, r, g, b] = match.map(Number);
+                if (g >= 110 && g > r * 1.25 && g > b * 1.15) return node;
+            }
+            if (node.getAttribute?.('role') === 'dialog') break;
+            node = node.parentElement;
+        }
+        return null;
+    }
+
+    async function selectVisibleCertificateRow() {
+        const wanted = normalize(FORM_TITLE);
+        const candidates = [...document.querySelectorAll('td,li,div,span,a')]
+            .filter(element => visible(element) && normalize(element.textContent) === wanted)
+            .sort((a, b) => {
+                const ar = a.getBoundingClientRect();
+                const br = b.getBoundingClientRect();
+                return (ar.width * ar.height) - (br.width * br.height);
+            });
+
+        for (const title of candidates) {
+            const rect = title.getBoundingClientRect();
+            const pointTarget = document.elementFromPoint(
+                rect.left + Math.min(Math.max(rect.width * .35, 30), rect.width - 5),
+                rect.top + rect.height / 2
+            );
+            const row = title.closest('[data-uid],tr,li,[role="option"],[role="row"],.k-item,.k-listview-item,.k-list-item') || title;
+            const targets = [...new Set([pointTarget, title, row])].filter(Boolean);
+
+            for (const target of targets) {
+                realMouseClick(target);
+                await sleep(180);
+                if (selectedCertificateShell(title)) return { title, row };
+            }
+
+            if (selectCertificateThroughKendo(title, row)) {
+                await sleep(180);
+                if (selectedCertificateShell(title)) return { title, row };
+            }
+
+            if (typeof window.jQuery !== 'undefined') {
+                window.jQuery(row).triggerHandler('mousedown');
+                window.jQuery(row).trigger('click');
+                await sleep(180);
+                if (selectedCertificateShell(title)) return { title, row };
+            }
+        }
+        return null;
+    }
+
+    function selectCertificateThroughKendo(title, fallbackRow) {
+        if (typeof window.jQuery === 'undefined') return false;
+        let node = title;
+        while (node && node !== document.body) {
+            const data = window.jQuery(node).data() || {};
+            const widget = Object.entries(data)
+                .find(([key, value]) => /^kendo/i.test(key) && value?.dataSource)?.[1];
+
+            if (widget) {
+                const view = widget.dataSource.view?.() || [];
+                const items = [];
+                const collect = values => values.forEach(value => {
+                    items.push(value);
+                    if (Array.isArray(value?.items)) collect(value.items);
+                });
+                collect(Array.from(view));
+
+                const item = items.find(value => {
+                    try { return normalize(JSON.stringify(value)).includes(normalize(FORM_TITLE)); }
+                    catch (e) { return false; }
+                });
+                const uid = item?.uid;
+                const row = uid
+                    ? node.querySelector?.(`[data-uid="${CSS.escape(uid)}"]`) ||
+                      node.closest?.('[data-role], .k-widget')?.querySelector?.(`[data-uid="${CSS.escape(uid)}"]`)
+                    : fallbackRow;
+
+                if (item && row) {
+                    widget.select?.(row);
+                    widget.trigger?.('change', { sender: widget });
+                    window.jQuery(row).trigger('change');
+                    return widget.dataItem?.(row) === item || row.matches('.k-state-selected,.k-selected,[aria-selected="true"]');
+                }
+            }
+            node = node.parentElement;
+        }
+        return false;
+    }
+
+    function normalize(value) {
+        return String(value || '')
+            .replace(/[‐‑‒–—−]/g, '-')
+            .replace(/[ё]/gi, 'е')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+    }
+
+    function isMse031Title(value) {
+        const text = normalize(value);
+        return text.includes('031') &&
+            text.includes('медико-социальн') &&
+            text.includes('экспертиз') &&
+            text.includes('объедин');
+    }
+
+    function findMse031Row(root) {
+        const rows = [...root.querySelectorAll('tr,[role="row"],li,.k-item,.k-list-item,.k-listview-item')];
+        const direct = rows.find(row => isMse031Title(row.textContent));
+        if (direct) return direct;
+
+        const leaves = [...root.querySelectorAll('td,span,div,a')]
+            .filter(element => visible(element) && isMse031Title(element.textContent))
+            .sort((a, b) => a.children.length - b.children.length);
+        const text = leaves[0];
+        return text?.closest('tr,[role="row"],li,.k-item,.k-list-item,.k-listview-item') || text || null;
+    }
+
+    function visible(element) {
+        return !!(
+            element &&
+            element.isConnected &&
+            element.getClientRects().length &&
+            getComputedStyle(element).visibility !== 'hidden'
+        );
+    }
+
+    async function waitFor(test, timeout = 8000, interval = 100) {
+        const end = Date.now() + timeout;
+        while (Date.now() < end) {
+            try {
+                const result = test();
+                if (result) return result;
+            } catch (e) {}
+            await sleep(interval);
+        }
+        return null;
+    }
+
+    function textElement(text, root = document, exact = true) {
+        const wanted = normalize(text);
+        return [...root.querySelectorAll('button, a, label, span, div, td')]
+            .filter(visible)
+            .find(element => {
+                const actual = normalize(element.textContent);
+                return exact ? actual === wanted : actual.includes(wanted);
+            }) || null;
+    }
+
+    function trigger(element, type) {
+        element.dispatchEvent(new Event(type, { bubbles: true }));
+    }
+
+    function getWidget(input) {
+        if (!input || typeof window.jQuery === 'undefined') return null;
+        const jq = window.jQuery(input);
+        return jq.data('kendoDropDownList') ||
+            jq.data('kendoComboBox') ||
+            jq.data('kendoMultiSelect') ||
+            jq.data('kendoDatePicker') ||
+            jq.data('kendoNumericTextBox') || null;
+    }
+
+    function dataRecords(source) {
+        if (!source) return [];
+        if (Array.isArray(source)) return source;
+        if (typeof source[Symbol.iterator] === 'function') return Array.from(source);
+
+        try {
+            const json = source.toJSON?.();
+            if (Array.isArray(json)) return json;
+            if (Array.isArray(json?.Data)) return json.Data;
+            if (Array.isArray(json?.data)) return json.data;
+        } catch (e) {}
+
+        if (Array.isArray(source.Data)) return source.Data;
+        if (Array.isArray(source.data)) return source.data;
+        return Object.values(source).filter(value => value && typeof value === 'object');
+    }
+
+    function fieldNearLabel(labelText, root = document) {
+        const label = [...root.querySelectorAll('label, div, span')]
+            .filter(element => normalize(element.textContent) === normalize(labelText))
+            .sort((a, b) => a.children.length - b.children.length)[0];
+
+        if (!label) return null;
+        if (label.htmlFor) {
+            const direct = root.getElementById?.(label.htmlFor) || document.getElementById(label.htmlFor);
+            if (direct) return direct;
+        }
+
+        let row = label.parentElement;
+        for (let i = 0; i < 4 && row; i++, row = row.parentElement) {
+            const fields = [...row.querySelectorAll('input:not([type="hidden"]), select, textarea')]
+                .filter(element => !element.disabled || element.dataset.role);
+            if (fields.length) return fields[fields.length - 1];
+        }
+        return null;
+    }
+
+    async function setChoice(labelText, wantedText, root = document) {
+        const input = fieldNearLabel(labelText, root);
+        if (!input) {
+            log('Поле не найдено:', labelText);
+            return false;
+        }
+
+        const widget = getWidget(input);
+        if (widget) {
+            const store = widget.dataSource;
+            if (store && !store.data().length) {
+                try { await store.read(); } catch (e) {}
+            }
+
+            const records = dataRecords(store?.data?.());
+            const wanted = normalize(wantedText);
+            const record = records.find(item => {
+                const data = item.toJSON ? item.toJSON() : item;
+                return Object.values(data).some(value => normalize(value) === wanted);
+            }) || records.find(item => {
+                const data = item.toJSON ? item.toJSON() : item;
+                return Object.values(data).some(value => normalize(value).includes(wanted));
+            });
+
+            if (record) {
+                const valueField = widget.options?.dataValueField;
+                const data = record.toJSON ? record.toJSON() : record;
+                widget.value(valueField ? data[valueField] : data.ID ?? data.Id ?? data.id);
+                widget.trigger('change');
+                return true;
+            }
+
+            try {
+                widget.text?.(wantedText);
+                widget.trigger('change');
+                if (normalize(widget.text?.()) === wanted) return true;
+            } catch (e) {}
+        }
+
+        if (input.tagName === 'SELECT') {
+            const option = [...input.options].find(item =>
+                normalize(item.textContent).includes(normalize(wantedText))
+            );
+            if (option) {
+                input.value = option.value;
+                trigger(input, 'change');
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function setText(input, value) {
+        if (!input || value == null) return false;
+        input.value = String(value);
+        trigger(input, 'input');
+        trigger(input, 'change');
+        trigger(input, 'blur');
+        return String(input.value) === String(value);
+    }
+
+    function setNumeric(input, value) {
+        if (!input) return false;
+        const widget = getWidget(input);
+        if (widget?.value) {
+            widget.value(Number(value));
+            widget.trigger('change');
+            return Number(widget.value()) === Number(value);
+        }
+        return setText(input, value);
+    }
+
+    function chooseRadioByText(text, root = document) {
+        const target = textElement(text, root, true);
+        if (!target) return false;
+        const label = target.closest('label') || target;
+        const input = label.htmlFor
+            ? document.getElementById(label.htmlFor)
+            : label.querySelector('input[type="radio"]') ||
+              label.parentElement?.querySelector('input[type="radio"]');
+        if (input) {
+            input.checked = true;
+            trigger(input, 'change');
+        } else {
+            label.click();
+        }
+        return true;
+    }
+
+    function getEditorText() {
+        const candidates = [];
+        document.querySelectorAll('iframe').forEach(frame => {
+            try {
+                const body = frame.contentDocument?.body;
+                if (body) candidates.push(body.innerText || body.textContent || '');
+            } catch (e) {}
+        });
+        document.querySelectorAll('[id^="editor_"]').forEach(element => {
+            candidates.push(element.innerText || element.textContent || '');
+        });
+        return candidates.sort((a, b) => b.length - a.length)[0] || '';
+    }
+
+    function extractFromRecord() {
+        const source = getEditorText().replace(/\u200b/g, '').trim();
+        const lower = source.toLowerCase();
+        const anamnesisStart = lower.indexOf('из анамнеза');
+        const diagnosisMatches = [...lower.matchAll(/диагноз\s*:?\s*/g)];
+        const diagnosisStart = diagnosisMatches.length
+            ? diagnosisMatches[diagnosisMatches.length - 1].index
+            : -1;
+
+        let anamnesis = '';
+        if (anamnesisStart >= 0) {
+            anamnesis = source.slice(
+                anamnesisStart,
+                diagnosisStart > anamnesisStart ? diagnosisStart : source.length
+            ).trim();
+        }
+
+        let diagnosisDetails = '';
+        if (diagnosisStart >= 0) {
+            diagnosisDetails = source.slice(diagnosisStart)
+                .replace(/^диагноз\s*:?\s*/i, '')
+                .split(/\n\s*(?:выдан|рекомендован|д2а|явка)/i)[0]
+                .replace(/^\s*[A-ZА-Я]\d{2}(?:\.\d+)?\s*/i, '')
+                .trim();
+        }
+
+        const groupMatch = lower.match(/инвалид(?:ом)?\s*(?:ность\s*)?(?:-|—)?\s*([123])\s*(?:-?й)?\s*групп/);
+        const disabilityGroup = groupMatch
+            ? ({ '1': 'Первая группа', '2': 'Вторая группа', '3': 'Третья группа' })[groupMatch[1]]
+            : DEFAULTS.disabilityGroup;
+
+        return { source, anamnesis, diagnosisDetails, disabilityGroup };
+    }
+
+    function getDispensaryDate() {
+        const rows = [...document.querySelectorAll('#gAnamnesDispensarRregistrations tr, [id*="AnamnesDispensar"] tr')];
+        for (const row of rows) {
+            const match = normalize(row.textContent).match(/\b\d{2}\.\d{2}\.\d{4}\b/);
+            if (match) return match[0];
+        }
+        return '';
+    }
+
+    function numericInputsForLabel(labelText) {
+        const label = [...document.querySelectorAll('label, div, span')]
+            .filter(element => normalize(element.textContent) === normalize(labelText))
+            .sort((a, b) => a.children.length - b.children.length)[0];
+        if (!label) return [];
+        let row = label.parentElement;
+        for (let i = 0; i < 4 && row; i++, row = row.parentElement) {
+            const inputs = [...row.querySelectorAll('input[data-role="numerictextbox"], input.k-input')]
+                .filter(input => input.type !== 'hidden' && !input.classList.contains('k-formatted-value'));
+            if (inputs.length) return inputs;
+        }
+        return [];
+    }
+
+    async function fillOpenForm() {
+        const form = document.getElementById('fHealthCertificates031PU');
+        if (!form) return false;
+
+        const record = extractFromRecord();
+
+        chooseRadioByText(DEFAULTS.workStatus, form);
+        await setChoice('Цель направления на МСЭ', DEFAULTS.referralPurpose, form);
+        await setChoice('Группа инвалидности', record.disabilityGroup, form);
+        await setChoice('Направление на заочное освидетельствование', DEFAULTS.remoteExamination, form);
+
+        if (record.diagnosisDetails) {
+            setText(document.getElementById('tbClinicalDiagnosisMainSick'), record.diagnosisDetails);
+        }
+
+        const dispensaryDate = getDispensaryDate();
+        if (dispensaryDate) {
+            const dateInput = document.getElementById('dpStartControlDateStr');
+            const picker = getWidget(dateInput);
+            if (picker?.value) {
+                const [day, month, year] = dispensaryDate.split('.').map(Number);
+                picker.value(new Date(year, month - 1, day));
+                picker.trigger('change');
+            } else {
+                setText(dateInput, dispensaryDate);
+            }
+        }
+
+        if (record.anamnesis) {
+            setText(document.getElementById('taAnamnesAnamnesisSick'), record.anamnesis);
+        }
+
+        await setChoice('Лечение, проводимое в настоящее время', DEFAULTS.treatmentDynamics, form);
+        await setChoice('Оценка результатов медицинской реабилитации', DEFAULTS.rehabilitationResult, form);
+        await setChoice('Реабилитационный прогноз', DEFAULTS.rehabilitationPrognosis, form);
+        await setChoice('Реабилитационный потенциал', DEFAULTS.rehabilitationPotential, form);
+
+        const bp = numericInputsForLabel('АД, мм. рт. ст.');
+        if (bp[0]) setNumeric(bp[0], DEFAULTS.vitals.pressureSystolic);
+        if (bp[1]) setNumeric(bp[1], DEFAULTS.vitals.pressureDiastolic);
+
+        const simpleVitals = [
+            ['Пульс, мин', DEFAULTS.vitals.pulse],
+            ['ЧДД, мин', DEFAULTS.vitals.respirationRate],
+            ['Температура тела', DEFAULTS.vitals.temperature],
+            ['Рост, см', DEFAULTS.vitals.height],
+            ['Объем талии, см', DEFAULTS.vitals.waist],
+            ['Вес, кг', DEFAULTS.vitals.weight],
+            ['Объем левого бедра, см', DEFAULTS.vitals.leftThigh],
+            ['Объем правого бедра, см', DEFAULTS.vitals.rightThigh]
+        ];
+
+        for (const [label, value] of simpleVitals) {
+            const input = fieldNearLabel(label, form);
+            if (input) setNumeric(input, value);
+        }
+
+        log('Основная форма заполнена. Сохранение не выполнялось.');
+        showStatus('Основная форма 031/у заполнена. Проверьте данные перед сохранением.', false);
+        return true;
+    }
+
+    async function openOrFill() {
+        if (window.__damumedMse031Busy) {
+            showStatus('МСЭ уже обрабатывается. Дождитесь окончания.', true);
+            return;
+        }
+        window.__damumedMse031Busy = true;
+        const button = document.getElementById('damumed-mse-031-helper');
+        if (button) {
+            button.disabled = true;
+            button.textContent = 'МСЭ: заполняем…';
+        }
+
+        try {
+            if (await fillOpenForm()) return;
+
+            const certificatePanel = textElement('СПРАВКИ', document, true);
+            certificatePanel?.click();
+            await sleep(500);
+
+            const addButton = document.querySelector('[id^="btnAddHealthCertificate_"]');
+            if (!addButton) throw new Error('Кнопка добавления справки не найдена');
+            addButton.click();
+
+            const choiceForm = await waitFor(
+                () => document.getElementById('healthCertificatesAddChoiceForm'),
+                7000
+            );
+            if (!choiceForm) throw new Error('Окно выбора справки не открылось');
+
+            const row = findMse031Row(choiceForm);
+            if (!row) throw new Error('Строка 031/у не найдена');
+
+            // У DMED выбранная строка хранится во внутреннем объекте, а визуальный
+            // CSS-класс появляется не всегда. Кликаем строго по строке штатной таблицы.
+            const cell = row.querySelector('td') || row;
+            realMouseClick(cell);
+            await sleep(500);
+
+            const add = await waitFor(() => {
+                const candidate = document.getElementById('bHealthCertificatesAddChoiceSave');
+                if (!candidate) return null;
+                const disabled =
+                    candidate.disabled ||
+                    candidate.getAttribute('aria-disabled') === 'true' ||
+                    candidate.classList.contains('k-state-disabled');
+                return disabled ? null : candidate;
+            }, 4000);
+
+            if (!add) {
+                throw new Error('Строка 031/у не выбралась или кнопка «Добавить» не активировалась');
+            }
+
+            realMouseClick(add);
+            await sleep(900);
+            const nextStep = await waitFor(() => {
+                const form = document.getElementById('fHealthCertificates031PU');
+                if (form) return { form };
+                const next = textElement('Продолжить', document, true);
+                return next ? { next } : null;
+            }, 15000);
+
+            if (!nextStep) throw new Error('DMED не открыл форму 031/у');
+
+            if (nextStep.next) {
+                // Предыдущая 031/у существует: подтверждаем создание на её основе.
+                // Ровно один клик, чтобы не вызвать повторный SQL deadlock.
+                nextStep.next.dataset.damumedMseClicked = '1';
+                realMouseClick(nextStep.next);
+            }
+
+            const form = nextStep.form || await waitFor(
+                () => document.getElementById('fHealthCertificates031PU'),
+                30000
+            );
+            if (!form) throw new Error('Форма 031/у не открылась');
+            await fillOpenForm();
+        } catch (error) {
+            console.error(PREFIX, error);
+            showStatus('Ошибка МСЭ: ' + error.message, true);
+        } finally {
+            window.__damumedMse031Busy = false;
+            if (button) {
+                button.disabled = false;
+                button.textContent = '⚡ МСЭ 031/у';
+            }
+        }
+    }
+
+    function showStatus(message, isError) {
+        let status = document.getElementById('damumed-mse-031-status');
+        if (!status) {
+            status = document.createElement('div');
+            status.id = 'damumed-mse-031-status';
+            status.style.cssText = [
+                'position:fixed', 'right:20px', 'bottom:145px', 'z-index:2147483647',
+                'max-width:360px', 'padding:8px 10px', 'border-radius:5px',
+                'color:#fff', 'font:12px Arial,sans-serif',
+                'box-shadow:0 2px 8px rgba(0,0,0,.25)'
+            ].join(';');
+            document.body.appendChild(status);
+        }
+        status.textContent = message;
+        status.style.background = isError ? '#b42318' : '#287a3e';
+        status.style.display = 'block';
+        clearTimeout(showStatus.timer);
+        showStatus.timer = setTimeout(() => status.style.display = 'none', isError ? 8000 : 3000);
+    }
+
+    function createButton() {
+        if (document.getElementById('damumed-mse-031-helper')) return;
+        const button = document.createElement('button');
+        button.id = 'damumed-mse-031-helper';
+        button.type = 'button';
+        button.textContent = '⚡ МСЭ 031/у';
+        button.title = 'Открыть и предварительно заполнить форму 031/у';
+        button.style.cssText = [
+            'position:fixed', 'z-index:2147483647',
+            'width:155px', 'height:36px', 'border:1px solid #8aaa5a',
+            'border-radius:6px', 'background:#dcebc1', 'color:#3d5422',
+            'font:14px Arial,sans-serif', 'cursor:pointer'
+        ].join(';');
+        button.addEventListener('click', openOrFill);
+        document.body.appendChild(button);
+        positionButton();
+    }
+
+    function positionButton() {
+        const button = document.getElementById('damumed-mse-031-helper');
+        if (!button) return;
+
+        const analyses = [...document.querySelectorAll('button')]
+            .find(item => visible(item) && normalize(item.textContent) === 'анализы');
+
+        if (analyses) {
+            const rect = analyses.getBoundingClientRect();
+            button.style.left = Math.max(5, rect.left - button.offsetWidth - 8) + 'px';
+            button.style.top = Math.max(5, rect.top + (rect.height - button.offsetHeight) / 2) + 'px';
+            button.style.right = 'auto';
+            button.style.bottom = 'auto';
+            return;
+        }
+
+        button.style.left = 'auto';
+        button.style.top = '70px';
+        button.style.right = '20px';
+        button.style.bottom = 'auto';
+    }
+
+    function start() {
+        createButton();
+        new MutationObserver(createButton).observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+        setInterval(positionButton, 500);
+        window.addEventListener('resize', positionButton);
+        log('Версия 0.4 запущена');
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start, { once: true });
+    } else {
+        start();
+    }
+})();
