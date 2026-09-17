@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Damumed — МСЭ 031/у помощник
 // @namespace    damumed-mse-031-helper
-// @version      1.2
+// @version      2.0
 // @description  Открывает и предварительно заполняет форму 031/у для МСЭ без сохранения
 // @match        https://doc-ast.dmed.kz/MedicalRecords*
 // @grant        none
@@ -387,26 +387,45 @@
         if (diagnosisStart >= 0) {
             diagnosisDetails = source.slice(diagnosisStart)
                 .replace(/^диагноз\s*:?\s*/i, '')
-                .split(/\n\s*(?:выдан|рекомендован|д2а|явка)/i)[0]
+                .split(/\n\s*(?:№\s*\d|rp\s*:|d\.t\.d\s*:|ds\s*:|способ введения|выдан|рекомендован|д2а|явка)/i)[0]
                 .replace(/^\s*[A-ZА-Я]\d{2}(?:\.\d+)?\s*/i, '')
                 .trim();
         }
+
+        const prescriptionMatch = source.match(
+            /(?:^|\n)\s*(Rp\s*:[\s\S]*?)(?=\n\s*(?:Д\s*\d|явка|рекомендован|$))/i
+        );
+        const treatmentDetails = prescriptionMatch
+            ? prescriptionMatch[1].replace(/\n{3,}/g, '\n\n').trim()
+            : '';
 
         const groupMatch = lower.match(/инвалид(?:ом)?\s*(?:ность\s*)?(?:-|—)?\s*([123])\s*(?:-?й)?\s*групп/);
         const disabilityGroup = groupMatch
             ? ({ '1': 'Первая группа', '2': 'Вторая группа', '3': 'Третья группа' })[groupMatch[1]]
             : DEFAULTS.disabilityGroup;
 
-        return { source, anamnesis, diagnosisDetails, disabilityGroup };
+        return { source, anamnesis, diagnosisDetails, disabilityGroup, treatmentDetails };
     }
 
-    function getDispensaryDate() {
+    function getMainDispensaryRecord() {
         const rows = [...document.querySelectorAll('#gAnamnesDispensarRregistrations tr, [id*="AnamnesDispensar"] tr')];
-        for (const row of rows) {
-            const match = normalize(row.textContent).match(/\b\d{2}\.\d{2}\.\d{4}\b/);
-            if (match) return match[0];
-        }
-        return '';
+        const records = rows.map(row => {
+            const cells = [...row.querySelectorAll('td')];
+            const takenDate = normalize(cells[0]?.textContent).match(/\b\d{2}\.\d{2}\.\d{4}\b/)?.[0] || '';
+            const diagnosis = (cells[1]?.textContent || '').replace(/\s+/g, ' ').trim();
+            const code = diagnosis.match(/\bF\d{2}(?:\.\d+)?\b/i)?.[0]?.toUpperCase() || '';
+            return { takenDate, diagnosis, code };
+        }).filter(item => item.takenDate && item.code);
+
+        if (!records.length) return { takenDate: '', diagnosis: '', code: '' };
+        records.sort((a, b) => {
+            const parse = value => {
+                const [d, m, y] = value.split('.').map(Number);
+                return new Date(y, m - 1, d).getTime();
+            };
+            return parse(a.takenDate) - parse(b.takenDate);
+        });
+        return records[0];
     }
 
     function numericInputsForLabel(labelText) {
@@ -423,22 +442,219 @@
         return [];
     }
 
+    function visibleDialogContaining(text) {
+        const wanted = normalize(text);
+        return [...document.querySelectorAll('.k-window-content,[role="dialog"],.modal-dialog,.ui-dialog-content')]
+            .filter(visible)
+            .find(dialog => normalize(dialog.textContent).includes(wanted)) || null;
+    }
+
+    function setStartDateInDialog(dialog) {
+        const inputs = [...dialog.querySelectorAll('input')].filter(input => {
+            if (!visible(input) || input.type === 'hidden') return false;
+            const hint = normalize([
+                input.id, input.name, input.getAttribute('aria-label'),
+                input.getAttribute('data-role'), input.placeholder
+            ].join(' '));
+            return /date|дата/.test(hint) || /^\d{2}\.\d{2}\.\d{4}$/.test(input.value);
+        });
+        if (!inputs.length) return;
+
+        const year = new Date().getFullYear();
+        const value = `07.01.${year}`;
+        const input = inputs[0];
+        const picker = getWidget(input);
+        if (picker?.value) {
+            picker.value(new Date(year, 0, 7));
+            picker.trigger('change');
+        } else {
+            setText(input, value);
+        }
+    }
+
+    function selectRowsByPatterns(dialog, patterns) {
+        const rows = [...dialog.querySelectorAll('tr,[role="row"],li,.k-item,.k-list-item')]
+            .filter(visible)
+            .filter(row => row.querySelector('td,input[type="checkbox"]'));
+        let selected = 0;
+
+        for (const pattern of patterns) {
+            const row = rows.find(candidate => pattern.test(normalize(candidate.textContent)));
+            if (!row || row.dataset.damumedMsePicked === '1') continue;
+            const checkbox = row.querySelector('input[type="checkbox"]');
+            if (checkbox && !checkbox.checked) realMouseClick(checkbox);
+            else if (!checkbox) realMouseClick(row.querySelector('td') || row);
+            row.dataset.damumedMsePicked = '1';
+            selected++;
+        }
+        return selected;
+    }
+
+    function panelForTab(tab, form) {
+        const item = tab.closest('li,[role="tab"]') || tab;
+        const controls = item.getAttribute('aria-controls');
+        if (controls) {
+            const controlled = document.getElementById(controls);
+            if (controlled) return controlled;
+        }
+
+        const strip = item.closest('.k-tabstrip,[data-role="tabstrip"]') ||
+            item.closest('[role="tablist"]')?.parentElement;
+        if (strip) {
+            const header = [...strip.children].find(child =>
+                child.matches('ul,.k-tabstrip-items,[role="tablist"]'));
+            const items = header ? [...header.children].filter(child =>
+                child.matches('li,[role="tab"],.k-item')) : [];
+            const index = items.indexOf(item);
+            const panels = [...strip.children].filter(child =>
+                child.matches('.k-content,[role="tabpanel"]'));
+            if (index >= 0 && panels[index]) return panels[index];
+        }
+
+        return null;
+    }
+
+    function findImportMenuButton(panel, form, tab) {
+        const tabRect = tab.getBoundingClientRect();
+        const visibleGrids = [...form.querySelectorAll('.k-grid,[data-role="grid"]')]
+            .filter(visible)
+            .filter(grid => grid.getBoundingClientRect().top >= tabRect.top - 10)
+            .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+        const activeGrid = visibleGrids[0] || null;
+        const toolbars = [...form.querySelectorAll('.k-grid-toolbar,.k-toolbar')]
+            .filter(visible)
+            .filter(toolbar => toolbar.getBoundingClientRect().top >= tabRect.bottom - 20)
+            .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+        const toolbar = activeGrid?.querySelector('.k-grid-toolbar,.k-toolbar') || toolbars[0] || null;
+        const roots = [toolbar, activeGrid, panel].filter(Boolean);
+        const candidates = [...new Set(roots.flatMap(root => [...root.querySelectorAll(
+            '[aria-haspopup="true"],button,a,[role="button"],.k-button,.k-split-button,.k-menu-button,' +
+            '.k-grid-toolbar > *, .k-toolbar > *'
+        )]))].filter(element => visible(element) && !element.disabled &&
+            element.getAttribute('aria-disabled') !== 'true');
+
+        const score = element => {
+            const text = normalize([
+                element.textContent, element.title, element.getAttribute('aria-label')
+            ].filter(Boolean).join(' '));
+            const classes = String(element.className || '').toLowerCase();
+            let value = 0;
+            if (element.getAttribute('aria-haspopup') === 'true') value += 100;
+            if (/|из выполненных|выполненн/.test(text)) value += 90;
+            if (/split|menu|dropdown/.test(classes)) value += 40;
+            if (element.closest('.k-grid-toolbar,.k-toolbar')) value += 100;
+            if (activeGrid?.contains(element)) value += 40;
+            if (panel?.contains(element)) value += 15;
+            if (/удал|сохран|закрыть|отмена/.test(text)) value -= 200;
+            const rect = element.getBoundingClientRect();
+            if (rect.width > 100 || rect.height > 60) value -= 20;
+            return value;
+        };
+        return candidates.sort((a, b) => score(b) - score(a))[0] || null;
+    }
+
+    async function importCompletedItems(form, tabName, patterns) {
+        const tab = [...form.querySelectorAll('li,a,span,div')]
+            .filter(visible)
+            .find(element => normalize(element.textContent) === normalize(tabName));
+        if (!tab) {
+            log('Вкладка не найдена:', tabName);
+            return 0;
+        }
+        realMouseClick(tab.closest('li,[role="tab"]') || tab);
+        await sleep(500);
+
+        const panel = panelForTab(tab, form);
+        let menuButton = findImportMenuButton(panel, form, tab);
+        if (!menuButton) {
+            await sleep(800);
+            menuButton = findImportMenuButton(panel, form, tab);
+        }
+        if (!menuButton) {
+            throw new Error(`${tabName}: кнопка с тремя линиями не найдена`);
+        }
+        realMouseClick(menuButton);
+        await sleep(250);
+
+        const fromCompleted = await waitFor(
+            () => textElement('Из выполненных услуг', document, false),
+            3000
+        );
+        if (!fromCompleted) {
+            throw new Error(`${tabName}: меню «Из выполненных услуг» не открылось`);
+        }
+        realMouseClick(fromCompleted);
+
+        const dialog = await waitFor(() =>
+            visibleDialogContaining('выполненн') ||
+            [...document.querySelectorAll('.k-window-content,[role="dialog"],.modal-dialog')]
+                .filter(visible)
+                .find(item => item !== form && item.querySelector('table')),
+        8000);
+        if (!dialog) {
+            throw new Error(`${tabName}: окно выполненных услуг не открылось`);
+        }
+
+        setStartDateInDialog(dialog);
+        await sleep(700);
+        const count = selectRowsByPatterns(dialog, patterns);
+        if (!count) {
+            const cancel = [...dialog.querySelectorAll('button,a')]
+                .filter(visible)
+                .find(item => /отмена|закрыть/.test(normalize(item.textContent)));
+            if (cancel) realMouseClick(cancel);
+            log('Подходящих записей нет:', tabName);
+            return 0;
+        }
+
+        const add = [...dialog.querySelectorAll('button,a')]
+            .filter(visible)
+            .find(item => normalize(item.textContent) === 'добавить');
+        if (!add) {
+            log('Кнопка «Добавить» не найдена:', tabName);
+            return 0;
+        }
+        realMouseClick(add);
+        await waitFor(() => !visible(dialog), 10000);
+        await sleep(500);
+        return count;
+    }
+
+    async function importMseServices(form) {
+        const total = [];
+        total.push(await importCompletedItems(form, 'Проведенные консультации', [
+            /терапевт/, /психиатр/, /невролог|невропатолог/, /психолог/, /кардиолог/
+        ]));
+        total.push(await importCompletedItems(form, 'Диагностические исследования', [
+            /электрокардио|\bэкг\b/, /флюоро/
+        ]));
+        total.push(await importCompletedItems(form, 'Лабораторные исследования', [
+            /общий анализ крови|\bоак\b/, /общий анализ мочи|\bоам\b/
+        ]));
+        return total.reduce((sum, value) => sum + value, 0);
+    }
+
     async function fillOpenForm() {
         const form = document.getElementById('fHealthCertificates031PU');
         if (!form) return false;
 
         const record = extractFromRecord();
+        const dispensary = getMainDispensaryRecord();
 
         chooseRadioByText(DEFAULTS.workStatus, form);
         await setChoice('Цель направления на МСЭ', DEFAULTS.referralPurpose, form);
         await setChoice('Группа инвалидности', record.disabilityGroup, form);
         await setChoice('Направление на заочное освидетельствование', DEFAULTS.remoteExamination, form);
 
+        if (dispensary.code) {
+            await setChoice('Основной диагноз', dispensary.code, form);
+        }
+
         if (record.diagnosisDetails) {
             setText(document.getElementById('tbClinicalDiagnosisMainSick'), record.diagnosisDetails);
         }
 
-        const dispensaryDate = getDispensaryDate();
+        const dispensaryDate = dispensary.takenDate;
         if (dispensaryDate) {
             const dateInput = document.getElementById('dpStartControlDateStr');
             const picker = getWidget(dateInput);
@@ -456,6 +672,11 @@
         }
 
         await setChoice('Лечение, проводимое в настоящее время', DEFAULTS.treatmentDynamics, form);
+        if (record.treatmentDetails) {
+            const treatmentInput = document.getElementById('taAnamnesTreatmentTreatmentDetails') ||
+                form.querySelector('[name="taAnamnesTreatmentTreatmentDetails"]');
+            if (treatmentInput) setText(treatmentInput, record.treatmentDetails);
+        }
         await setChoice('Оценка результатов медицинской реабилитации', DEFAULTS.rehabilitationResult, form);
         await setChoice('Реабилитационный прогноз', DEFAULTS.rehabilitationPrognosis, form);
         await setChoice('Реабилитационный потенциал', DEFAULTS.rehabilitationPotential, form);
@@ -481,8 +702,48 @@
         }
 
         log('Основная форма заполнена. Сохранение не выполнялось.');
-        showStatus('Основная форма 031/у заполнена. Проверьте данные перед сохранением.', false);
+        showStatus('Форма 031/у заполнена. Услуги добавляются отдельной кнопкой.', false);
         return true;
+    }
+
+    async function runMseServices() {
+        const form = document.getElementById('fHealthCertificates031PU');
+        const button = document.getElementById('damumed-mse-services-helper');
+        if (!form) {
+            showStatus('Сначала откройте форму 031/у.', true);
+            return;
+        }
+        if (window.__damumedMseServicesBusy) {
+            showStatus('Услуги МСЭ уже обрабатываются.', true);
+            return;
+        }
+
+        window.__damumedMseServicesBusy = true;
+        if (button) {
+            button.disabled = true;
+            button.textContent = 'Услуги: ищем…';
+        }
+        try {
+            // Нижние Kendo-вкладки создаются позже основной формы.
+            await waitFor(() => textElement('Проведенные консультации', form, true), 10000);
+            await sleep(800);
+            const imported = await importMseServices(form);
+            showStatus(
+                imported
+                    ? `Услуги МСЭ добавлены: ${imported}. Проверьте перед сохранением.`
+                    : 'Подходящие услуги не найдены. Форма не сохранена.',
+                imported === 0
+            );
+        } catch (error) {
+            console.error(PREFIX, error);
+            showStatus('Ошибка услуг МСЭ: ' + error.message, true);
+        } finally {
+            window.__damumedMseServicesBusy = false;
+            if (button) {
+                button.disabled = false;
+                button.textContent = '⚡ Услуги МСЭ';
+            }
+        }
     }
 
     async function openOrFill() {
@@ -594,26 +855,49 @@
     }
 
     function createButton() {
-        if (document.getElementById('damumed-mse-031-helper')) return;
-        const button = document.createElement('button');
-        button.id = 'damumed-mse-031-helper';
-        button.type = 'button';
-        button.textContent = '⚡ МСЭ 031/у';
-        button.title = 'Открыть и предварительно заполнить форму 031/у';
-        button.style.cssText = [
-            'position:fixed', 'z-index:2147483647',
-            'width:155px', 'height:36px', 'border:1px solid #8aaa5a',
-            'border-radius:6px', 'background:#dcebc1', 'color:#3d5422',
-            'font:14px Arial,sans-serif', 'cursor:pointer'
-        ].join(';');
-        button.addEventListener('click', openOrFill);
-        document.body.appendChild(button);
+        if (!document.getElementById('damumed-mse-031-helper')) {
+            const button = document.createElement('button');
+            button.id = 'damumed-mse-031-helper';
+            button.type = 'button';
+            button.textContent = '⚡ МСЭ 031/у';
+            button.title = 'Открыть и предварительно заполнить форму 031/у';
+            button.style.cssText = [
+                'position:fixed', 'z-index:2147483647',
+                'width:155px', 'height:36px', 'border:1px solid #8aaa5a',
+                'border-radius:6px', 'background:#dcebc1', 'color:#3d5422',
+                'font:14px Arial,sans-serif', 'cursor:pointer'
+            ].join(';');
+            button.addEventListener('click', openOrFill);
+            document.body.appendChild(button);
+        }
+
+        if (!document.getElementById('damumed-mse-services-helper')) {
+            const services = document.createElement('button');
+            services.id = 'damumed-mse-services-helper';
+            services.type = 'button';
+            services.textContent = '⚡ Услуги МСЭ';
+            services.title = 'Добавить консультации, диагностику и лабораторные исследования';
+            services.style.cssText = [
+                'position:fixed', 'z-index:2147483647',
+                'width:155px', 'height:36px', 'border:1px solid #4f86b8',
+                'border-radius:6px', 'background:#d9ebfb', 'color:#214d73',
+                'font:14px Arial,sans-serif', 'cursor:pointer', 'display:none'
+            ].join(';');
+            services.addEventListener('click', runMseServices);
+            document.body.appendChild(services);
+        }
         positionButton();
     }
 
     function positionButton() {
         const button = document.getElementById('damumed-mse-031-helper');
+        const services = document.getElementById('damumed-mse-services-helper');
         if (!button) return;
+
+        if (services) {
+            const formOpen = !!document.getElementById('fHealthCertificates031PU');
+            services.style.display = formOpen ? 'block' : 'none';
+        }
 
         const analyses = [...document.querySelectorAll('button')]
             .find(item => visible(item) && normalize(item.textContent) === 'анализы');
@@ -624,6 +908,12 @@
             button.style.top = Math.max(5, rect.top + (rect.height - button.offsetHeight) / 2) + 'px';
             button.style.right = 'auto';
             button.style.bottom = 'auto';
+            if (services) {
+                services.style.left = button.style.left;
+                services.style.top = (parseFloat(button.style.top) + button.offsetHeight + 6) + 'px';
+                services.style.right = 'auto';
+                services.style.bottom = 'auto';
+            }
             return;
         }
 
@@ -631,6 +921,12 @@
         button.style.top = '70px';
         button.style.right = '20px';
         button.style.bottom = 'auto';
+        if (services) {
+            services.style.left = 'auto';
+            services.style.right = '20px';
+            services.style.top = '112px';
+            services.style.bottom = 'auto';
+        }
     }
 
     function start() {
@@ -641,7 +937,7 @@
         });
         setInterval(positionButton, 500);
         window.addEventListener('resize', positionButton);
-        log('Версия 0.4 запущена');
+        log('Версия 1.6 запущена');
     }
 
     if (document.readyState === 'loading') {
