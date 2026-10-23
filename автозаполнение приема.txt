@@ -649,18 +649,28 @@ async function fillPatient(w){
 }
 
 function hideRecommendationPopup(){
- const elements=document.querySelectorAll('[role="dialog"]');
+ // Нельзя скрывать окно через display:none: ExtJS оставляет x-mask,
+ // из-за чего вся страница выглядит белой и перестаёт нажиматься.
+ if(typeof Ext==='undefined'||!Ext.ComponentQuery)return;
 
- elements.forEach(el=>{
-  const text=(el.textContent||'')
-   .replace(/\s+/g,' ')
-   .trim();
+ Ext.ComponentQuery.query('window').forEach(w=>{
+  const el=w.getEl?.()?.dom;
+  const text=(el?.innerText||'').replace(/\s+/g,' ').trim();
 
   if(
    text.includes('Вы можете выделить текст рекомендации')&&
    text.includes('Добавить как рекомендацию по лечению')
   ){
-   el.style.setProperty('display','none','important');
+   const no=[...el.querySelectorAll('button,input,a,.x-btn,.x-btn-inner')]
+    .find(btn=>String(btn.innerText||btn.value||btn.textContent||'')
+     .replace(/\s+/g,' ').trim().toLowerCase()==='нет');
+
+   if(no){
+    (no.closest?.('.x-btn')||no).click();
+   }else{
+    const close=el.querySelector('.x-tool-close,.close,[aria-label="Закрыть"],[aria-label="Close"]');
+    if(close)close.click();
+   }
   }
  });
 }
@@ -888,46 +898,13 @@ const timer=setInterval(()=>{
  }
 },500);
 
-new MutationObserver(mutations=>{
- mutations.forEach(mutation=>{
-  mutation.addedNodes.forEach(node=>{
-   if(node.nodeType!==1)return;
-
-   const elements=[];
-
-   if(
-    node.matches?.(
-     '[role="dialog"], .modal, [class*="modal"], [class*="popup"], [class*="dialog"]'
-    )
-   ){
-    elements.push(node);
-   }
-
-   if(node.querySelectorAll){
-    elements.push(
-     ...node.querySelectorAll(
-      '[role="dialog"], .modal, [class*="modal"], [class*="popup"], [class*="dialog"]'
-     )
-    );
-   }
-
-   elements.forEach(el=>{
-    const text=(el.textContent||'')
-     .replace(/\s+/g,' ')
-     .trim();
-
-    if(
-     text.includes('Вы можете выделить текст рекомендации')&&
-     text.includes('Добавить как рекомендацию по лечению')
-    ){
-     el.style.setProperty('display','none','important');
-    }
-   });
-  });
- });
-}).observe(document.body,{
+// Точный обработчик уведомления рекомендаций. Он вызывает штатное действие
+// ExtJS, поэтому диалог и затемняющая маска закрываются вместе.
+new MutationObserver(hideRecommendationPopup).observe(document.body,{
  childList:true,
  subtree:true
 });
+
+setInterval(hideRecommendationPopup,200);
 
 })();
