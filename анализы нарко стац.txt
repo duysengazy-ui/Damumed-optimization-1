@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Damumed — анализы SANGUIS
 // @namespace    local.damumed.labs
-// @version      1.0.0
+// @version      1.0.1
 // @description  Три пользовательских набора анализов через штатные формы Damumed.
 // @match        https://doc-ast.dmed.kz/MedicalRecords*
 // @grant        none
@@ -83,7 +83,11 @@
     else w.open();
     await wait(()=>{guard(form);return Array.from(w.dataSource.view()).length;},'Список '+id);
     const data=Array.from(w.dataSource.view()), found=data.map((d,i)=>({d,i})).filter(x=>predicate(x.d,w));
-    if(found.length!==1)fail('В списке «'+id+'» нет одного точного совпадения. Выберите вручную.');
+    // DMED иногда отдаёт несколько одинаковых пунктов Sanguis. В этом
+    // единственном случае первый вариант соответствует тому же получателю.
+    const duplicateReceiver = id==='cmbTemplateReceiver' && found.length>1 &&
+      found.every(x=>norm(read(x.d,w.options.dataTextField))===receiverName);
+    if(found.length!==1 && !duplicateReceiver)fail('В списке «'+id+'» нет одного точного совпадения. Выберите вручную.');
     guard(form);
     if(String(w.value()??'')!==before)fail('Поле «'+id+'» изменилось во время загрузки. Проверьте вручную.');
     const desired=String(read(found[0].d,w.options.dataValueField));
