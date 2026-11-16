@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DMED — Перенос предыдущего рецепта АЛО
 // @namespace    dmed-prescription-helper
-// @version      1.6
+// @version      1.7
 // @description  Перенос параметров предыдущего рецепта в новый рецепт АЛО
 // @match        https://doc-ast.dmed.kz/*
 // @grant        none
@@ -375,41 +375,59 @@
     }
 
     async function ensureAloRecipeForm() {
-        let search = document.querySelector('#tbSearchFreeMedication');
+        let search = [...document.querySelectorAll('#tbSearchFreeMedication')]
+            .find(visible);
         if (search) return search;
 
-        const aloTab = [...document.querySelectorAll('a, button, span, div')]
-            .find(element =>
-                visible(element) &&
-                String(element.textContent || '')
-                    .replace(/\s+/g, ' ')
-                    .trim()
-                    .toLowerCase() === 'рецепты ало'
-            );
+        const panels = [...document.querySelectorAll('#FreePrescriptionDrugs')];
+        const panel = panels.find(element => visible(element)) || panels[0];
 
-        if (aloTab) {
-            aloTab.click();
-            await new Promise(resolve => setTimeout(resolve, 300));
+        if (!panel) {
+            log('Раздел #FreePrescriptionDrugs не найден');
+            return null;
         }
 
-        search = await waitFor(() =>
-            document.querySelector('#tbSearchFreeMedication'), 1200
+        if (panel.getAttribute('aria-expanded') !== 'true') {
+            const panelBarElement = panel.closest('.k-panelbar');
+            const panelBar = panelBarElement
+                ? $(panelBarElement).data('kendoPanelBar')
+                : null;
+
+            if (panelBar) {
+                panelBar.expand(panel, false);
+            } else {
+                const panelLink = [...panel.children]
+                    .find(element => element.matches?.('a.k-link'));
+                panelLink?.click();
+            }
+        }
+
+        await waitFor(() =>
+            panel.getAttribute('aria-expanded') === 'true' &&
+            panel.querySelector('.k-content'), 6000
         );
+
+        search = [...document.querySelectorAll('#tbSearchFreeMedication')]
+            .find(visible);
         if (search) return search;
 
-        const addButton = [...document.querySelectorAll(
-            '.k-grid-add, [title*="Добав" i], [aria-label*="Добав" i], a, button'
-        )].find(element => {
-            if (!visible(element)) return false;
-            const text = String(element.textContent || '').trim();
-            return element.matches('.k-grid-add, [title*="Добав" i], [aria-label*="Добав" i]') ||
-                text === '+';
-        });
+        const addButton = [...panel.querySelectorAll('a, button')]
+            .find(element =>
+                element.getAttribute('title') === 'Добавить' &&
+                String(element.getAttribute('onclick') || '')
+                    .includes('openAddPatientFreePrescriptionDrug')
+            );
 
-        if (addButton) addButton.click();
+        if (!addButton) {
+            log('Штатная кнопка «Добавить» в разделе рецептов не найдена');
+            return null;
+        }
+
+        addButton.click();
 
         return await waitFor(() =>
-            document.querySelector('#tbSearchFreeMedication'), 6000
+            [...document.querySelectorAll('#tbSearchFreeMedication')]
+                .find(visible), 8000
         );
     }
 
@@ -736,19 +754,27 @@
     function findAvailableDrugRow(recipe) {
         const mnn = String(recipe.mnn || '').trim().toLowerCase();
 
+        const normalizeDosage = value => {
+            const match = String(value ?? '')
+                .replace(',', '.')
+                .match(/\d+(?:\.\d+)?/);
+
+            if (!match) return '';
+
+            const number = Number(match[0]);
+            return Number.isFinite(number) ? String(number) : match[0];
+        };
+
         // Для поиска используем реальную дозировку препарата.
         // В некоторых рецептах recipe.Dosage содержит количество
         // таблеток в упаковке (например, 25), а не дозировку препарата.
-        const dosage = String(
-    (
-        String(recipe.rp || recipe.Rp || '').match(
-            /,\s*([\d.,]+)\s*мг/i
-        )?.[1] ||
-        recipe.dosageConcentration ||
-        recipe.dosage ||
-        ''
-    )
-).trim();
+        const dosage = normalizeDosage(
+            String(recipe.rp || recipe.Rp || '').match(
+                /,\s*([\d.,]+)\s*мг/i
+            )?.[1] ||
+            recipe.dosageConcentration ||
+            recipe.dosage
+        );
 
         const rows = [...document.querySelectorAll('tr')];
 
@@ -769,9 +795,7 @@
                 data.DrugMNNName || ''
             ).trim().toLowerCase();
 
-            const itemDosage = String(
-                data.Dosage ?? ''
-            ).trim();
+            const itemDosage = normalizeDosage(data.Dosage);
 
             const packages = Number(
                 data.StockInPackages || 0
@@ -870,21 +894,65 @@
         }
 
         const match = methods[matchIndex];
+        const matchValue = firstPresent(
+            match.StrID,
+            match.ID,
+            match.Id,
+            match.id
+        );
+
+        if (matchValue == null) {
+            log('У способа введения отсутствует идентификатор:', match);
+            return false;
+        }
 
         // Сначала выбираем именно строку ComboBox,
         // затем синхронизируем его значение и событие change.
         combo.select(matchIndex);
-        combo.value(String(match.ID));
+        combo.value(String(matchValue));
         combo.trigger('change');
+
+        const selected = combo.dataItem(combo.select());
 
         log(
             'Способ введения установлен:',
-            match.ID,
+            matchValue,
             match.Name
         );
 
-        return String(combo.value() || '') === String(match.ID) &&
-            !!String(combo.text?.() || combo.input?.val?.() || '').trim();
+        return !!selected &&
+            String(combo.value() || '') === String(matchValue) &&
+            normalizeText(selected.Name) === normalizeText(match.Name);
+    }
+
+    async function selectDrugRow(row) {
+        const grid = getGridFromRow(row);
+
+        if (!grid) {
+            log('Kendo Grid остатков не найден');
+            return false;
+        }
+
+        // Обычный DOM click не всегда вызывает change, особенно если строка
+        // уже была подсвечена. Вызываем штатный цикл выбора Kendo явно.
+        grid.select(row);
+        grid.trigger('change');
+
+        return !!await waitFor(() => {
+            const selected = grid.select();
+            const selectedRow = selected?.[0];
+            const dosage = String(
+                document.querySelector('#txtFreeDosage')?.value || ''
+            ).trim();
+            const concentration = String(
+                document.querySelector('#txtDosageConcentration')?.value || ''
+            ).trim();
+            const rp = String(
+                document.querySelector('#txtRp')?.value || ''
+            ).trim();
+
+            return selectedRow === row && dosage && concentration && rp;
+        }, 5000);
     }
 
     // ------------------------------------------------------------
@@ -1151,12 +1219,19 @@
         );
 
         // --------------------------------------------------------
-        // Кликаем по найденному препарату
+        // Выбираем препарат через штатный Kendo Grid и проверяем,
+        // что Damumed действительно заполнил зависимые поля.
         // --------------------------------------------------------
 
-        row.click();
+        const drugSelected = await selectDrugRow(row);
 
-        $(row).trigger('click');
+        if (!drugSelected) {
+            alert(
+                'Препарат найден, но Damumed не применил выбранную строку.\n\n' +
+                'Строка оставлена для ручного выбора; рецепт не сохранялся.'
+            );
+            return;
+        }
 
         // --------------------------------------------------------
         // ДОБАВЛЕНО:
@@ -1338,3 +1413,4 @@
     }
 
 })();
+
